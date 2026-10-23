@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+venv/
+.venv/
+build/
+dist/
+*.spec
+app/config.json
+app/indiedl_config.json
+*.indiedl_tmp.*
+*.indiedl_h264.*
