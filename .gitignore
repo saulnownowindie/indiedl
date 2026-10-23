@@ -1,12 +1,13 @@
 __pycache__/
 *.py[cod]
 *.log
+*.log.*
+config.json
+**/config.json
 venv/
 .venv/
 build/
 dist/
 *.spec
-app/config.json
-app/indiedl_config.json
 *.indiedl_tmp.*
 *.indiedl_h264.*
