@@ -1,5 +1,5 @@
 """Indie Now DL - descargador para Windows con integración de navegador."""
-import json, os, queue, re, shutil, subprocess, sys, threading, time, traceback, tempfile
+import json, os, queue, re, shutil, subprocess, sys, threading, time, traceback, tempfile, uuid
 from pathlib import Path
 from urllib.parse import unquote, parse_qsl
 
@@ -217,10 +217,11 @@ def enforce_clip(ff, path, section, mode, quality, q):
                     os.remove(temporary)
             except OSError:
                 pass
-            cmd = [ff, "-y", "-ss", format_seconds(start), "-i", path,
-                   "-t", format_seconds(wanted), "-map", "0:v:0?", "-map", "0:a:0?",
+            cmd = [ff, "-y", "-i", path, "-ss", format_seconds(start),
+                   "-t", format_seconds(wanted), "-map", "0:v:0?", "-map", "0:a?",
                    "-c:v", encoder, *quality_args, "-profile:v", "high", "-pix_fmt", "yuv420p",
-                   "-c:a", "aac", "-b:a", "192k", "-avoid_negative_ts", "make_zero",
+                   "-fps_mode", "passthrough",
+                   "-c:a", "aac", "-b:a", "192k",
                    "-movflags", "+faststart", temporary]
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -396,10 +397,11 @@ def ensure_mp4_aac(ff, src, q):
     base = os.path.splitext(src)[0]
     dst = base + ".indiedl_tmp.mp4"
     final = base + ".mp4"
-    cmd = [ff, "-y", "-i", src, "-map", "0:v:0?", "-map", "0:a:0",
+    cmd = [ff, "-y", "-copyts", "-start_at_zero", "-i", src,
+           "-map", "0:v:0?", "-map", "0:a?",
            "-c:v", "copy",
            "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k", "-ar", "48000",
-           "-map_metadata", "0",
+           "-map_metadata", "0", "-map_chapters", "0",
            "-movflags", "+faststart", dst]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW, timeout=900)
@@ -508,13 +510,8 @@ def video_needs_h264(info):
     pm = re.search(r"\b(yuvj?4\d\dp\w*|gbrp\w*|nv\d+|p0\d+\w*|rgb\w*|bgr\w*)\b", line)
     if pm and pm.group(1) not in ("yuv420p", "yuvj420p"):
         return f"formato de píxel {pm.group(1)}"
-    f = re.search(r"([\d.]+)\s*fps", line)
-    t = re.search(r"([\d.]+)(k?)\s*tbr", line)
-    if f and t:
-        fps = float(f.group(1))
-        tbr = float(t.group(1)) * (1000 if t.group(2) else 1)
-        if tbr and abs(fps - tbr) / tbr > 0.02:
-            return f"cuadros variables ({fps:g} fps vs {tbr:g} tbr)"
+    # Variable frame rate is valid media. Do not re-encode it just because
+    # ffprobe's nominal fps and tbr differ; that can introduce A/V drift.
     return None
 
 def ensure_h264(ff, src, q):
@@ -535,16 +532,17 @@ def ensure_h264(ff, src, q):
     for encoder, quality_args, device in encoders:
         if device == "CPU":
             q.put(("log", "No se pudo usar NVENC; convirtiendo con CPU para que la descarga siga funcionando"))
-        for sync in (["-fps_mode", "cfr"], ["-vsync", "cfr"]):
+        for sync in (["-fps_mode", "passthrough"], []):
             try:
                 if os.path.exists(dst):
                     os.remove(dst)
             except OSError:
                 pass
-            cmd = [ff, "-y", "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+            cmd = [ff, "-y", "-copyts", "-start_at_zero", "-i", src,
+                   "-map", "0:v:0", "-map", "0:a?",
                    "-c:v", encoder, *quality_args, "-profile:v", "high",
                    "-pix_fmt", "yuv420p", *sync, "-c:a", "copy",
-                   "-map_metadata", "0", "-movflags", "+faststart", dst]
+                   "-map_metadata", "0", "-map_chapters", "0", "-movflags", "+faststart", dst]
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                    creationflags=NO_WINDOW, timeout=1800)
@@ -884,13 +882,16 @@ def parse_progress(line):
 def exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section=None):
     ff = ffmpeg_path()
     t0 = time.time()
+    job_suffix = (f" [clip {fmt_hms(section[0]).replace(':', '-')}-"
+                  f"{fmt_hms(section[1]).replace(':', '-')}-{uuid.uuid4().hex[:6]}]"
+                  if section else "")
     done_file = TEMP_DIR / f"final_{int(t0)}.txt"
     cmd = [exe, "--newline", "--no-colors", "--no-playlist", "--windows-filenames",
            "--no-mtime",
            "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
            "--concurrent-fragments", "4",
            "-P", f"home:{folder}", "-P", f"temp:{TEMP_DIR}",
-           "-o", "%(title).80s [%(id)s].%(ext)s",
+           "-o", f"%(title).80s [%(id)s]{job_suffix}.%(ext)s",
            "--progress-template", "download:IDLP|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
                                   "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
            "--print-to-file", "after_move:%(title)s|||%(filepath)s", str(done_file)]
@@ -1073,8 +1074,11 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                     q.put(("log", txt))
 
             image_prefix = "%(playlist_index)02d - " if mode == "image" else ""
+            job_suffix = (f" [clip {fmt_hms(section[0]).replace(':', '-')}-"
+                          f"{fmt_hms(section[1]).replace(':', '-')}-{uuid.uuid4().hex[:6]}]"
+                          if section else "")
             opts = {
-                "outtmpl": os.path.join(folder, image_prefix + "%(title).80s [%(id)s].%(ext)s"),
+                "outtmpl": os.path.join(folder, image_prefix + f"%(title).80s [%(id)s]{job_suffix}.%(ext)s"),
                 "noplaylist": mode != "image", "quiet": True, "no_warnings": True, "noprogress": True,
                 "windowsfilenames": True, "progress_hooks": [hook], "postprocessor_hooks": [phook],
                 "concurrent_fragment_downloads": 4,
