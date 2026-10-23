@@ -1143,11 +1143,15 @@ def build_app():
             self.spin_i = 0
             self.t0 = time.time()
             self.title("Indie Now DL")
-            # Layout ancho y redimensionable: dos columnas para evitar que el
-            # usuario tenga que desplazarse para llegar a las opciones.
-            self.geometry("1440x900")
-            self.minsize(1280, 720)
+            # Abrir ocupando el escritorio para que las opciones queden a la
+            # vista en dos columnas y no sea necesario desplazarse.
+            self.geometry("1520x920")
+            self.minsize(1180, 680)
             self.resizable(True, True)
+            try:
+                self.state("zoomed")
+            except Exception:
+                pass
             self.configure(fg_color="#0D1116")
             self.attributes("-topmost", True)
             self.after(800, lambda: self.attributes("-topmost", False))
@@ -1157,11 +1161,11 @@ def build_app():
 
             left = ctk.CTkFrame(self, fg_color="#0D1116", corner_radius=0)
             left.grid(row=0, column=0, sticky="nsew")
-            right = ctk.CTkFrame(self, fg_color=BLACK, corner_radius=0, width=320)
+            right = ctk.CTkFrame(self, fg_color=BLACK, corner_radius=0, width=340)
             right.grid(row=0, column=1, sticky="nsew")
             right.grid_propagate(False)
 
-            self.hdr = ctk.CTkImage(halftone_header(900, 120), size=(900, 120))
+            self.hdr = ctk.CTkImage(halftone_header(1040, 120), size=(1040, 120))
             hf = ctk.CTkFrame(left, fg_color="#0D1116", corner_radius=0, height=120)
             hf.pack(fill="x")
             hf.pack_propagate(False)
