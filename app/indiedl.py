@@ -178,6 +178,108 @@ def parse_timestamp(value):
     except (ValueError, TypeError):
         return None
 
+def format_seconds(value):
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+def media_duration(ff, path):
+    info = probe(ff, path)
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info)
+    if not match:
+        return None
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+def enforce_clip(ff, path, section, mode, quality, q):
+    """Verify yt-dlp actually returned the requested range; cut locally if it didn't."""
+    start, end = section
+    wanted = max(0.0, float(end) - float(start))
+    duration = media_duration(ff, path)
+    # A completed section should never be longer than the requested range.
+    # If yt-dlp returns the whole source, do the cut ourselves before success.
+    if duration is not None and duration <= wanted + 1.25:
+        q.put(("log", f"Duración del recorte verificada: {format_seconds(duration)} s"))
+        return path
+
+    q.put(("log", "yt-dlp devolvió el archivo completo; aplicando el recorte In/Out con FFmpeg"))
+    source_base, source_ext = os.path.splitext(path)
+    if mode == "video":
+        target = path if source_ext.lower() == ".mp4" else source_base + " [recorte].mp4"
+        temporary = os.path.splitext(target)[0] + ".indiedl_clip.tmp.mp4"
+        encoders = [
+            ("h264_nvenc", ["-preset", "p4", "-cq", "20"], "GPU"),
+            ("libx264", ["-preset", "veryfast", "-crf", "20"], "CPU"),
+        ]
+        last_error = ""
+        for encoder, quality_args, device in encoders:
+            if device == "CPU":
+                q.put(("log", "NVENC no está disponible para el recorte; usando CPU"))
+            try:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+            cmd = [ff, "-y", "-ss", format_seconds(start), "-i", path,
+                   "-t", format_seconds(wanted), "-map", "0:v:0?", "-map", "0:a:0?",
+                   "-c:v", encoder, *quality_args, "-profile:v", "high", "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "192k", "-avoid_negative_ts", "make_zero",
+                   "-movflags", "+faststart", temporary]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                        errors="replace", creationflags=NO_WINDOW, timeout=1800)
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+            last_error = (result.stderr or "")[-700:]
+            if result.returncode == 0 and os.path.isfile(temporary) and os.path.getsize(temporary) > 0:
+                clipped_duration = media_duration(ff, temporary)
+                if clipped_duration is None or clipped_duration <= wanted + 1.25:
+                    break
+            try:
+                if os.path.exists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+        else:
+            raise RuntimeError("No se pudo verificar ni aplicar el recorte In/Out. " + last_error[-300:])
+    else:
+        # Audio outputs are selected by the existing audio format menu.
+        target = path
+        temporary = source_base + ".indiedl_clip.tmp" + source_ext
+        codec_args = {
+            ".mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+            ".wav": ["-c:a", "pcm_s16le"],
+            ".m4a": ["-c:a", "aac", "-b:a", "256k"],
+        }.get(source_ext.lower(), ["-c:a", "copy"])
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+        cmd = [ff, "-y", "-ss", format_seconds(start), "-i", path,
+               "-t", format_seconds(wanted), "-map", "0:a:0", "-vn", *codec_args, temporary]
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", creationflags=NO_WINDOW, timeout=1800)
+        if result.returncode != 0 or not os.path.isfile(temporary) or os.path.getsize(temporary) <= 0:
+            raise RuntimeError("No se pudo aplicar el recorte al audio. " + (result.stderr or "")[-300:])
+        clipped_duration = media_duration(ff, temporary)
+        if clipped_duration is not None and clipped_duration > wanted + 1.25:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+            raise RuntimeError("FFmpeg no pudo verificar la duración del recorte de audio.")
+
+    try:
+        os.replace(temporary, target)
+    except OSError as exc:
+        raise RuntimeError(f"No se pudo guardar el recorte final: {exc}") from exc
+    if os.path.abspath(path) != os.path.abspath(target):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    q.put(("log", f"Recorte In/Out aplicado: {format_seconds(start)}–{format_seconds(end)} s ({device if mode == 'video' else 'audio'})"))
+    return target
+
 def maybe_update_ytdlp(cfg, q, force=False):
     if not force and time.time() - float(cfg.get("last_update", 0) or 0) < UPDATE_EVERY_DAYS * 86400:
         return True
@@ -798,11 +900,12 @@ def exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section=None):
         cmd += ["-f", "bestaudio/best", "-x", "--audio-format", quality or AUDIO_CODEC]
         if (quality or AUDIO_CODEC) != "wav":
             cmd += ["--audio-quality", AUDIO_QUALITY + "K"]
+        if section:
+            cmd += ["--download-sections", f"*{section[0]}-{section[1]}"]
     else:
         cmd += ["-f", vfmt(quality), "--merge-output-format", "mp4"]
         if section:
-            cmd += ["--download-sections", f"*{section[0]}-{section[1]}", "--force-keyframes-at-cuts",
-                    "--postprocessor-args", "ffmpeg:-c:v h264_nvenc -preset p4 -cq 20 -pix_fmt yuv420p -profile:v high -fps_mode cfr"]
+            cmd += ["--download-sections", f"*{section[0]}-{section[1]}", "--force-keyframes-at-cuts"]
     if "instagram.com" in url.lower():
         try:
             browser, profile = cookie_source(cfg)
@@ -865,6 +968,11 @@ def exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section=None):
         try: done_file.unlink()
         except OSError: pass
     if not final or not os.path.isfile(final):
+        if section:
+            raise RuntimeError(
+                "yt-dlp no confirmó el archivo recortado. No voy a marcar el video completo como si fuera el fragmento pedido. "
+                "Revisá si FFmpeg está disponible y vuelve a intentarlo."
+            )
         fresh = [p for p in Path(folder).glob("*") if p.is_file()
                  and t0 - 2 <= p.stat().st_mtime <= t0 + 600
                  and not p.name.endswith((".part", ".ytdl", ".temp"))]
@@ -897,6 +1005,8 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
         q.put(("stage", 0, "Descargando"))
         q.put(("log", "Iniciando descarga de " + site_name(url).title()))
         q.put(("log", "Directorio temporal activo: " + temp_path))
+        if section:
+            q.put(("log", f"Rango In/Out solicitado: {fmt_hms(section[0])} → {fmt_hms(section[1])}"))
         if mode == "image":
             gallery_dl_download(url, folder, cfg, q, cancel, image_indices)
             return
@@ -977,13 +1087,12 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 if section:
                     opts["download_sections"] = [f"*{section[0]}-{section[1]}"]
                     opts["force_keyframes_at_cuts"] = True
-                    opts["postprocessor_args"] = {
-                        "ffmpeg": ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-pix_fmt", "yuv420p", "-profile:v", "high", "-fps_mode", "cfr"]
-                    }
             elif mode == "audio":
                 opts.update(format="bestaudio/best", postprocessors=[{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": quality or AUDIO_CODEC, "preferredquality": AUDIO_QUALITY}])
+                if section:
+                    opts["download_sections"] = [f"*{section[0]}-{section[1]}"]
             else:
                 raise RuntimeError("Modo imagen debe ir por gallery-dl.")
 
@@ -1016,6 +1125,11 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                  if isinstance(path, str) and os.path.isfile(path) and os.path.getsize(path) > 0),
                 None
             )
+
+        if section:
+            if not final or not os.path.isfile(final):
+                raise RuntimeError("No se generó ningún archivo para el rango In/Out seleccionado.")
+            final = enforce_clip(ff, final, section, mode, quality, q)
 
         if final and os.path.isfile(final):
             final = safe_media_name(final, q)
@@ -1137,24 +1251,24 @@ def build_app():
             self._carousel_thumb_refs = []
             self._metadata_cache = {}
             self._metadata_loading = set()
+            self._metadata_generation = 0
             self._last_clip_url = None
             self._gallery_dl_ok = self._check_gallery_dl()
             self.stage = -1
             self.spin_i = 0
             self.t0 = time.time()
             self.title("Indie Now DL")
-            # Abrir ocupando el escritorio para que las opciones queden a la
-            # vista en dos columnas y no sea necesario desplazarse.
-            self.geometry("1520x920")
-            self.minsize(1180, 680)
+            # Ventana normal, centrada y dimensionada según la pantalla. Evita
+            # el salto visual de abrir primero en pequeño y maximizar después.
+            screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+            width = min(1480, max(760, screen_w - 48))
+            height = min(860, max(560, screen_h - 96))
+            min_w = min(1180, max(760, screen_w - 48))
+            min_h = min(680, max(560, screen_h - 96))
+            self.minsize(min_w, min_h)
             self.resizable(True, True)
-            try:
-                self.state("zoomed")
-            except Exception:
-                pass
+            self.geometry(f"{width}x{height}+{max(0, (screen_w-width)//2)}+{max(0, (screen_h-height)//2)}")
             self.configure(fg_color="#0D1116")
-            self.attributes("-topmost", True)
-            self.after(800, lambda: self.attributes("-topmost", False))
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=0)
             self.grid_rowconfigure(0, weight=1)
@@ -1546,7 +1660,7 @@ def build_app():
                     try: self.after_cancel(self._meta_job)
                     except Exception: pass
                 if url and clean_url(url):
-                    self._meta_job = self.after(100, lambda u=url: self.fetch_metadata(u))
+                    self._meta_job = self.after(350, lambda u=url: self.fetch_metadata(u))
             if self._last_clip_url != url:
                 self._last_clip_url = url
                 if hasattr(self, "v_clip") and self.v_clip.get():
@@ -1556,17 +1670,38 @@ def build_app():
                         self.clip_end.delete(0, "end")
                     except Exception:
                         pass
-            yt_long = site == "YOUTUBE" and "/shorts/" not in url.lower() and "/live/" not in url.lower()
-            if hasattr(self, "clip_toggle") and hasattr(self, "clip_frame"):
-                if yt_long:
-                    self.clip_toggle.grid()
-                    self.clip_frame.grid()
-                else:
-                    self.clip_toggle.grid_remove()
-                    self.clip_frame.grid_remove()
-                    self.v_clip.set(False)
+            self._sync_clip_controls()
+
+        def _sync_clip_controls(self):
+            if not (hasattr(self, "clip_toggle") and hasattr(self, "clip_frame")):
+                return
+            url = self.url.get().strip()
+            site = site_name(url) if url else "LINK"
+            supported = (site == "YOUTUBE" and self.cur_mode in ("video", "audio")
+                         and "/shorts/" not in url.lower() and "/live/" not in url.lower())
+            if supported:
+                self.clip_toggle.grid()
+                self.clip_frame.grid()
+            else:
+                self.clip_toggle.grid_remove()
+                self.clip_frame.grid_remove()
+                self.v_clip.set(False)
 
         def fetch_metadata(self, url):
+            if url in self._metadata_cache:
+                info = self._metadata_cache[url]
+                title = str(info.get("title") or "Contenido detectado")
+                author = str(info.get("uploader") or info.get("channel") or info.get("creator") or "Autor no disponible")
+                duration = info.get("duration")
+                duration_text = f"{int(duration)//60}:{int(duration)%60:02d}" if duration else "Duración no disponible"
+                width, height = info.get("width"), info.get("height")
+                resolution = f"{width} × {height}" if width and height else "Resolución disponible al descargar"
+                meta = f"@{author.lstrip('@')}  ·  {duration_text}  ·  {resolution}  ·  {str(info.get('ext') or 'media').upper()}"
+                self.apply_metadata(url, title, meta, None, "Miniatura no disponible")
+                return
+            if url in self._metadata_loading:
+                return
+            self._metadata_loading.add(url)
             def worker():
                 try:
                     import yt_dlp
@@ -1659,7 +1794,12 @@ def build_app():
                         except Exception as gallery_exc:
                             log(f"metadata gallery-dl {url}: {gallery_exc!r}")
                     self.after(0, lambda: self.apply_metadata(url, "No se pudieron cargar los detalles", "El enlace se recibió correctamente. La descarga se puede intentar igualmente; revisá la conexión o el registro.", None, "Vista previa no disponible"))
-            threading.Thread(target=worker, daemon=True).start()
+            def guarded_worker():
+                try:
+                    worker()
+                finally:
+                    self._metadata_loading.discard(url)
+            threading.Thread(target=guarded_worker, daemon=True).start()
 
         def apply_metadata(self, url, title, meta, thumb_data=None, thumb_status=None):
             if self.url.get().strip() != url:
@@ -1741,6 +1881,7 @@ def build_app():
                 self.l_q.configure(text="▧ Tipo de imagen")
                 self.menu.configure(values=IMAGE_F)
                 self.menu.set("Original")
+            self._sync_clip_controls()
 
         def begin_image_selection(self, url, folder, quality):
             if self._image_dialog is not None:
@@ -2177,17 +2318,16 @@ def build_app():
     app.mainloop()
 
 if __name__ == "__main__":
-    # 1. Auto-registrar el protocolo ytdl:// en Windows
-    if os.name == "nt":
-        try:
-            register()
-            log("Protocolo ytdl:// auto-registrado correctamente.")
-        except Exception as e:
-            log(f"Error al auto-registrar protocolo: {e}")
-
-    # 2. Si el instalador lo llama solo para registrar, salir sin abrir la ventana
+    # El instalador registra el protocolo con --register-only. No tocar el
+    # registro en cada apertura: evita demora y errores de permisos repetidos.
     if "--register-only" in sys.argv:
+        try:
+            if os.name == "nt":
+                register()
+                log("Protocolo ytdl:// registrado por el instalador.")
+        except Exception as e:
+            log(f"No se pudo registrar ytdl://: {e}")
         sys.exit(0)
 
-    # 3. Abrir la interfaz gráfica
+    # Abrir una sola interfaz en una ventana dimensionada para la pantalla.
     build_app()
