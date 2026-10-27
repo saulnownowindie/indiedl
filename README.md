@@ -121,7 +121,7 @@ indiedl/
 ## Problemas comunes
 
 **«Falta yt-dlp» o falla la descarga de YouTube**
-La app se autoactualiza a la nightly de yt-dlp al arrancar. Si el error sigue, corré:
+La app actualiza sola la nightly de yt-dlp una vez por día, justo antes de la primera descarga (puede tardar unos segundos esa primera vez). Si el error sigue, corré:
 `%LOCALAPPDATA%\IndieDL\venv\Scripts\python.exe -m pip install -U --pre "yt-dlp[default,curl-cffi]"`
 
 **Instagram pide login**

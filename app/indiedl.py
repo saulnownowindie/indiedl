@@ -1043,6 +1043,17 @@ def ensure_temp_dir():
     return temp_path
 
 def ytdlp_exe():
+    """yt-dlp suelto, sólo si el módulo de Python no está disponible.
+
+    El camino normal es el módulo `yt_dlp` que instala INSTALAR.bat: es el que
+    la app mantiene actualizado con pip. Un .exe de winget puede quedar viejo
+    y romper las descargas, así que sólo se usa como último recurso.
+    """
+    try:
+        import yt_dlp  # noqa: F401
+        return None
+    except Exception:
+        pass
     cands = []
     local = os.environ.get("LOCALAPPDATA", "")
     if local:
@@ -1215,14 +1226,30 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 "o reinstalá IndieDL. Sin ffmpeg no se puede unir audio y video."
             )
 
+        # yt-dlp publica versiones casi a diario y YouTube rompe seguido: se
+        # actualiza una vez por día, en este mismo hilo (nunca en paralelo con
+        # otra descarga) y sin bloquear la ventana.
+        try:
+            maybe_update_ytdlp(cfg, q)
+        except Exception:
+            pass
+
         exe = ytdlp_exe() if mode in ("video", "audio") else None
         if exe:
             final, _title = exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section)
             st = {"files": [], "meta": True, "title": _title}
             res = {"title": _title}
         else:
-            q.put(("log", "yt-dlp.exe no encontrado; usando el motor interno"))
-            import yt_dlp
+            # Sin .exe suelto: se usa el módulo de yt-dlp del entorno. Es el
+            # camino normal (INSTALAR.bat lo instala con pip), así que no hay
+            # ningún aviso que mostrar acá.
+            try:
+                import yt_dlp
+            except Exception as exc:
+                raise RuntimeError(
+                    "No encontré yt-dlp: falta el ejecutable y también el módulo "
+                    "de Python. Ejecutá INSTALAR.bat y volvé a intentar."
+                ) from exc
             st = {"files": [], "meta": False, "title": ""}
 
             def hook(d):
