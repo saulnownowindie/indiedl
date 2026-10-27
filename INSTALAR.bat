@@ -1,10 +1,28 @@
 @echo off
 setlocal
-title IndieDL - Instalador
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\setup_windows.ps1"
+cd /d "%~dp0"
+title Indie Now DL - Instalador
+
+where powershell >nul 2>&1
 if errorlevel 1 (
   echo.
-  echo La instalacion termino con errores. Copia el mensaje de arriba para revisarlo.
+  echo No se encontro PowerShell en este equipo.
+  echo Windows 10/11 lo trae de fabrica; si falta, instala Windows Management Framework.
+  echo.
   pause
+  exit /b 1
 )
-endlocal
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\instalar.ps1" %*
+set "RC=%ERRORLEVEL%"
+
+echo.
+if not "%RC%"=="0" (
+  echo   La instalacion termino con errores ^(codigo %RC%^).
+  echo   Copia el mensaje de arriba si necesitas ayuda.
+) else (
+  echo   Instalacion completada.
+)
+echo.
+pause
+exit /b %RC%

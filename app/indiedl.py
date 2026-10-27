@@ -689,6 +689,7 @@ def browser_profile_candidates():
         ("chrome", local / "Google" / "Chrome" / "User Data"),
         ("edge", local / "Microsoft" / "Edge" / "User Data"),
         ("brave", local / "BraveSoftware" / "Brave-Browser" / "User Data"),
+        ("helium", local / "imput" / "Helium" / "User Data"),
     ]
     for browser, root in chromium_roots:
         for name in ("Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4"):
@@ -721,12 +722,21 @@ def cookie_source(cfg):
             found = next((c for c in candidates if c["browser"] == "firefox"), None)
         if found:
             return "firefox", found["profile"]
+        found = next((c for c in candidates if c["browser"] == "helium"), None)
+        if found:
+            # Helium usa Chromium y mantiene sus claves/cookies bajo su propio User Data.
+            return "chromium", found["profile"]
         for browser in ("chrome", "edge", "brave"):
             if any(c["browser"] == browser for c in candidates):
                 log(f"Cookies: usando {browser} sin verificar sesión de Instagram. "
                     "Si falla, elegí Zen/Firefox en ⚙ SESIÓN IG.")
                 return browser, None
         return None, None
+    if choice == "helium":
+        found = next((c for c in browser_profile_candidates() if c["browser"] == "helium"), None)
+        if not found:
+            raise RuntimeError("No encontré el perfil de Helium. Abrí Helium, iniciá sesión en Instagram y volvé a intentar.")
+        return "chromium", found["profile"]
     if choice in ("chrome", "edge", "brave", "chromium", "opera", "vivaldi"):
         return choice, None
     if choice.startswith("firefox:"):
@@ -734,10 +744,143 @@ def cookie_source(cfg):
         if profile and Path(profile).exists():
             return "firefox", profile
         raise RuntimeError("La ruta del perfil Firefox/Zen configurado ya no existe. Elegí Auto o seleccioná el navegador otra vez.")
-    raise RuntimeError("Navegador de cookies no reconocido. Elegí Auto, Zen, Firefox, Chrome, Edge o Brave en ⚙ SESIÓN.")
+    raise RuntimeError("Navegador de cookies no reconocido. Elegí Auto, Zen, Firefox, Helium, Chrome, Edge o Brave en ⚙ SESIÓN.")
 
-def gallery_dl_args(cfg):
+COOKIES_FILE = APP_DIR / "instagram_cookies.txt"
+YT_COOKIES = APP_DIR / "youtube_cookies.txt"
+
+def yt_cookie_opts(url):
+    """cookies.txt de YouTube (sesion iniciada) solo para links de YouTube."""
+    u = str(url).lower()
+    if ("youtube.com" in u or "youtu.be" in u) and YT_COOKIES.is_file() and YT_COOKIES.stat().st_size > 0:
+        return {"cookiefile": str(YT_COOKIES)}
+    return {}
+
+def cookies_file_path(cfg=None):
+    """cookies.txt exportado: funciona con el navegador abierto y evita el bloqueo/cifrado de Chromium."""
+    try:
+        if COOKIES_FILE.is_file() and COOKIES_FILE.stat().st_size > 0:
+            return str(COOKIES_FILE)
+    except OSError:
+        pass
+    return None
+
+class _QuietLog:
+    def debug(self, *a, **k): pass
+    def info(self, *a, **k): pass
+    def warning(self, *a, **k): pass
+    def error(self, *a, **k): pass
+
+BROWSER_PROC_HINT = {"helium": "helium", "chrome": "chrome", "edge": "msedge", "brave": "brave",
+                     "zen": "zen", "firefox": "firefox"}
+BROWSER_PRETTY = {"helium": "Helium", "chrome": "Chrome", "edge": "Edge", "brave": "Brave",
+                  "zen": "Zen", "firefox": "Firefox"}
+
+def _is_lock_error(exc):
+    low = str(exc).lower()
+    return "permission" in low or "errno 13" in low or "could not copy" in low or "being used" in low
+
+def running_browser_processes(key):
+    """Nombres de procesos (.exe) del navegador que están abiertos ahora."""
+    if os.name != "nt":
+        return []
+    hint = BROWSER_PROC_HINT.get(key, key)
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=20, creationflags=NO_WINDOW).stdout
+    except Exception:
+        return []
+    names = set()
+    for line in out.splitlines():
+        m = re.match(r'"([^"]+)"', line.strip())
+        if m and hint in m.group(1).lower() and m.group(1).lower().endswith(".exe"):
+            names.add(m.group(1))
+    return sorted(names)
+
+def close_browser_processes(names):
+    for n in names:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/IM", n], capture_output=True, timeout=20,
+                           creationflags=NO_WINDOW)
+        except Exception:
+            pass
+
+def _instagram_cookie_rows(jar):
+    """Solo cookies de instagram.com en formato Netscape. Devuelve (filas, tiene_sessionid)."""
+    import time as _t
+    far = int(_t.time()) + 365 * 24 * 3600
+    rows, has = ["# Netscape HTTP Cookie File"], False
+    for c in jar:
+        dom = c.domain or ""
+        if "instagram.com" not in dom:
+            continue
+        if c.name == "sessionid" and c.value:
+            has = True
+        exp = int(c.expires) if c.expires and int(c.expires) > _t.time() else far
+        rows.append("\t".join([dom, "TRUE" if dom.startswith(".") else "FALSE", c.path or "/",
+                               "TRUE" if c.secure else "FALSE", str(exp), c.name, c.value or ""]))
+    return rows, has
+
+def import_instagram_cookies_auto(cfg=None):
+    """Busca la sesión de Instagram en los navegadores instalados y guarda SOLO las cookies de
+    instagram.com en un archivo local. Devuelve (ok, estado, detalle):
+    estado = ok | locked (navegador abierto, detalle=clave) | nosession | error."""
+    try:
+        from yt_dlp.cookies import extract_cookies_from_browser
+    except Exception as exc:
+        return False, "error", f"yt-dlp no disponible: {exc}"
+    choice = str((cfg or {}).get("cookies_browser", "auto") or "auto").lower()
+    order, seen = [], set()
+    for c in sorted(browser_profile_candidates(), key=lambda c: (c["browser"] != choice,)):
+        name = "firefox" if c["browser"] in ("zen", "firefox") else ("chromium" if c["browser"] == "helium" else c["browser"])
+        key = (name, c["profile"])
+        if key not in seen:
+            seen.add(key)
+            order.append((name, c["profile"], c["browser"]))
+    if not order:
+        return False, "error", "No encontré ningún navegador con perfil en esta PC."
+    locked, nosession, errors = None, False, []
+    for name, profile, label in order:
+        try:
+            jar = extract_cookies_from_browser(name, profile, _QuietLog())
+        except Exception as exc:
+            if _is_lock_error(exc):
+                locked = locked or label
+            errors.append(f"{label}: {str(exc)[:150]}")
+            continue
+        rows, has = _instagram_cookie_rows(jar)
+        if has:
+            try:
+                APP_DIR.mkdir(parents=True, exist_ok=True)
+                COOKIES_FILE.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            except OSError as exc:
+                return False, "error", f"No pude guardar las cookies: {exc}"
+            log(f"Sesión de Instagram detectada en {label} ({len(rows) - 1} cookies guardadas).")
+            return True, "ok", label
+        nosession = True
+    if locked:
+        return False, "locked", locked
+    if nosession:
+        return False, "nosession", ""
+    return False, "error", " | ".join(errors)[:400]
+
+def auto_fail_text(status, info):
+    if status == "nosession":
+        return "Encontré navegadores pero ninguno tiene sesión de Instagram. Iniciá sesión en uno e intentá de nuevo."
+    if status == "locked":
+        return f"{BROWSER_PRETTY.get(info, info)} está abierto y bloquea sus cookies."
+    return "No pude leer la sesión automáticamente. Usá COOKIES.TXT. " + (info or "")
+
+def gallery_dl_args(cfg, use_cookies=True):
     args = gallery_dl_command()
+    if not use_cookies:
+        log("Cookies para gallery-dl: ninguna (acceso anónimo)")
+        return args
+    cf = cookies_file_path(cfg)
+    if cf:
+        args.extend(["--cookies", cf])
+        log("Cookies para gallery-dl: archivo cookies.txt")
+        return args
     browser, profile = cookie_source(cfg)
     if browser:
         selector = f"{browser}:{profile}" if profile else browser
@@ -747,8 +890,80 @@ def gallery_dl_args(cfg):
         log("Cookies del navegador no configuradas; gallery-dl intentará acceder sin sesión.")
     return args
 
+def add_cookie_lock_hint(detail):
+    lowered = str(detail).lower().replace("/", "\\")
+    if "permission denied" in lowered and ("cookies" in lowered or "\\cookies" in lowered):
+        return (detail + "\nWindows no permitió leer la base de cookies porque Helium la tiene abierta. "
+                "Cerrá Helium completamente (incluido el icono junto al reloj) y reintentá. "
+                "Si sigue igual (Chromium cifra las cookies y a veces no se pueden leer ni con el navegador cerrado), "
+                "abrí ⚙ SESIÓN IG → 'Archivo cookies.txt' y cargá un cookies.txt exportado de instagram.com.")
+    return detail
+
+def _parse_gdl_dump(stdout):
+    """Lee la salida de `gallery-dl --dump-json`.
+    Formato real: un JSON (con sangría, en varias líneas) = [[2, {dir}], [3, "url", {meta}], ...].
+    También acepta un JSON por línea o varios JSON seguidos."""
+    values = []
+    text = stdout.strip()
+    if text:
+        try:
+            values.append(json.loads(text))
+        except Exception:
+            dec, pos = json.JSONDecoder(), 0
+            while pos < len(text):
+                while pos < len(text) and text[pos].isspace():
+                    pos += 1
+                if pos >= len(text):
+                    break
+                try:
+                    obj, pos = dec.raw_decode(text, pos)
+                    values.append(obj)
+                except Exception:
+                    nl = text.find("\n", pos)
+                    pos = len(text) if nl < 0 else nl + 1
+    found = []
+
+    def walk(v):
+        if isinstance(v, list):
+            if len(v) >= 3 and v[0] == 3 and isinstance(v[1], str) and isinstance(v[2], dict):
+                meta = dict(v[2])
+                meta["_url"] = v[1]
+                found.append(meta)
+            else:
+                for x in v:
+                    walk(x)
+        elif isinstance(v, dict):
+            direct = v.get("_url") or v.get("url") or v.get("file_url") or v.get("gdl_file_url")
+            if isinstance(direct, str) and direct.startswith("http"):
+                found.append(dict(v))
+    for v in values:
+        walk(v)
+    entries = []
+    for e in found:
+        direct = e.get("_url") or e.get("url") or e.get("file_url") or e.get("gdl_file_url")
+        if direct:
+            e["_indiedl_url"] = direct
+            entries.append(e)
+    return entries
+
+def _cookie_unreadable(msg):
+    low = str(msg).lower()
+    return ("permission denied" in low and "cookies" in low) or "could not decrypt" in low or "failed to decrypt" in low
+
 def gallery_dl_extract(url, cfg, timeout=90):
-    cmd = gallery_dl_args(cfg) + ["--dump-json", "--simulate", "--no-colors", url]
+    try:
+        return _gallery_dl_extract(url, cfg, timeout, True)
+    except RuntimeError as first:
+        if not _cookie_unreadable(first) or cookies_file_path(cfg):
+            raise
+        log("No se pudieron leer las cookies del navegador; reintento sin sesión.")
+        try:
+            return _gallery_dl_extract(url, cfg, timeout, False)
+        except RuntimeError:
+            raise first
+
+def _gallery_dl_extract(url, cfg, timeout, use_cookies):
+    cmd = gallery_dl_args(cfg, use_cookies) + ["--dump-json", "--simulate", "--no-colors", url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, creationflags=NO_WINDOW)
@@ -756,45 +971,17 @@ def gallery_dl_extract(url, cfg, timeout=90):
         raise RuntimeError("No está instalado gallery-dl. Ejecutá el instalador actualizado de IndieDL.") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Instagram tardó demasiado en responder. Probá de nuevo o revisá la sesión del navegador.") from exc
-    lines = (proc.stdout or "").splitlines()
-    entries = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(data, dict):
-            direct = (data.get("_url") or data.get("url") or data.get("file_url")
-                      or data.get("gdl_file_url"))
-            if not direct:
-                for key in ("metadata", "data", "file"):
-                    nested = data.get(key)
-                    if isinstance(nested, dict):
-                        direct = (nested.get("_url") or nested.get("url") or nested.get("file_url")
-                                  or nested.get("gdl_file_url"))
-                        if direct:
-                            data = {**data, **nested}
-                            break
-            if direct:
-                data["_indiedl_url"] = direct
-                entries.append(data)
-        elif isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    direct = item.get("_url") or item.get("url") or item.get("file_url")
-                    if direct:
-                        item["_indiedl_url"] = direct
-                        entries.append(item)
+    entries = _parse_gdl_dump(proc.stdout or "")
     if not entries:
-        detail = (proc.stderr or proc.stdout or "").strip()
+        detail = (proc.stderr or "").strip()
+        if not detail and (proc.stdout or "").lstrip()[:1] not in ("[", "{"):
+            detail = (proc.stdout or "").strip()
         if proc.returncode:
             detail = detail[-1000:]
         if not detail:
             detail = "gallery-dl no devolvió elementos de imagen para este enlace."
-        if any(word in detail.lower() for word in ("login", "cookie", "401", "403", "checkpoint", "challenge", "redirect to login")):
+        detail = add_cookie_lock_hint(detail)
+        if "permission denied" not in detail.lower() and any(word in detail.lower() for word in ("login", "cookie", "401", "403", "checkpoint", "challenge", "redirect to login")):
             detail += "\nInstagram rechazó la sesión usada. En IndieDL abrí ⚙ SESIÓN IG y elegí el navegador donde realmente está abierta tu cuenta. Si acabás de reinstalar Windows, iniciá sesión otra vez en ese navegador. Cerralo por completo y reintentá para liberar la base de cookies."
         if not detail.startswith("Instagram") and "instagram.com" in url.lower():
             detail += "\nSi el post es un video (no carrusel de fotos), usá el modo VIDEO."
@@ -817,20 +1004,26 @@ def gallery_dl_download(url, folder, cfg, q, cancel, image_indices=None):
     q.put(("stage", 1, f"Descargando imágenes ({len(chosen)} seleccionadas)"))
     q.put(("prog", 0.0, None, None, 0, 0, 0, len(chosen)))
     rango = ",".join(str(i) for i in chosen)
-    args = gallery_dl_args(cfg) + [
-        "--directory", folder,
-        "--filename", "{post_id}_{num}.{extension}",
-        "--range", rango,
-        "--no-colors",
-        url,
-    ]
-    proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=300, creationflags=NO_WINDOW)
+    def _run(use_cookies):
+        a = gallery_dl_args(cfg, use_cookies) + [
+            "--directory", folder,
+            "--filename", "{post_id}_{num}.{extension}",
+            "--range", rango,
+            "--no-colors",
+            url,
+        ]
+        return subprocess.run(a, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=300, creationflags=NO_WINDOW)
+    proc = _run(True)
+    if proc.returncode and _cookie_unreadable((proc.stderr or "") + (proc.stdout or "")) and not cookies_file_path(cfg):
+        log("Cookies ilegibles al descargar; reintento sin sesión.")
+        proc = _run(False)
     if cancel.is_set():
         raise RuntimeError("Cancelado")
     if proc.returncode:
         detail = (proc.stderr or proc.stdout or f"gallery-dl terminó con código {proc.returncode}").strip()
-        if any(word in detail.lower() for word in ("login", "cookie", "401", "403", "checkpoint", "challenge", "redirect to login")):
+        detail = add_cookie_lock_hint(detail)
+        if "permission denied" not in detail.lower() and any(word in detail.lower() for word in ("login", "cookie", "401", "403", "checkpoint", "challenge", "redirect to login")):
             detail += "\nInstagram no aceptó las cookies usadas por IndieDL. Si usás Zen, cerralo por completo y reintentá."
         raise RuntimeError(detail[-1100:])
     q.put(("log", f"Imágenes descargadas: {len(chosen)}"))
@@ -907,7 +1100,10 @@ def exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section=None):
         cmd += ["-f", vfmt(quality), "--merge-output-format", "mp4"]
         if section:
             cmd += ["--download-sections", f"*{section[0]}-{section[1]}", "--force-keyframes-at-cuts"]
-    if "instagram.com" in url.lower():
+    if "instagram.com" in url.lower() and cookies_file_path(cfg):
+        cmd += ["--cookies", cookies_file_path(cfg)]
+        q.put(("log", "Sesión de Instagram: archivo cookies.txt"))
+    elif "instagram.com" in url.lower():
         try:
             browser, profile = cookie_source(cfg)
             if browser:
@@ -1086,6 +1282,7 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
             }
             if ff:
                 opts["ffmpeg_location"] = ff
+            opts.update(yt_cookie_opts(url))
             if mode == "video":
                 opts.update(format=vfmt(quality), merge_output_format="mp4")
                 if section:
@@ -1222,8 +1419,37 @@ def halftone_header(w, h):
     d.text((tx, ty), text, font=font, fill="black")
     return img
 
+def cached_header(w=1040, h=120):
+    """Devuelve la cabecera ya renderizada.
+
+    La primera vez se dibuja y se guarda en disco; las siguientes aperturas la
+    cargan en unos pocos milisegundos. Así la ventana puede mostrarse completa
+    desde el primer fotograma, sin que se vea cómo se arma la interfaz.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return halftone_header(w, h)
+    cache_dir = APP_DIR / "cache"
+    path = cache_dir / f"header_{w}x{h}_v2.png"
+    try:
+        if path.is_file() and path.stat().st_size > 512:
+            img = Image.open(path)
+            img.load()
+            return img.convert("RGB")
+    except Exception as exc:
+        log(f"cached_header lectura: {exc!r}")
+    img = halftone_header(w, h)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        img.save(path)
+    except Exception as exc:
+        log(f"cached_header guardado: {exc!r}")
+    return img
+
 def build_app():
     import customtkinter as ctk
+    import tkinter as tk
     from tkinter import filedialog, messagebox
     ctk.set_appearance_mode("dark")
     BLACK, WHITE, YEL, YEL_H = "#0A0D10", "#F4F6F8", "#FFF333", "#FFE600"
@@ -1233,11 +1459,201 @@ def build_app():
     AUDIO_F = ["wav", "mp3", "m4a"]
     IMAGE_F = ["Original"]
     QFONT = "Segoe UI"
-    SPIN = "|/-\\"
+    SPIN = "◐◓◑◒"
+
+    class SmoothScroll(ctk.CTkFrame):
+        """Área de scroll propia con rueda suave y siempre activa.
+
+        CustomTkinter sólo mueve su CTkScrollableFrame cuando el puntero cae
+        exactamente sobre el lienzo o sobre un hijo que reconoce; con tarjetas
+        y etiquetas anidadas eso falla a veces y obliga a arrastrar la barra.
+        Acá un único manejador global busca el área que está debajo del puntero
+        y anima el desplazamiento con una curva corta (la misma idea que usa
+        AutoSubs para sus paneles: 150-200 ms, una sola curva, sin rebotes).
+        """
+
+        def __init__(self, master, fg_color=BLACK, registry=None,
+                     scrollbar_button_color="#2B333C", **kwargs):
+            super().__init__(master, fg_color=fg_color, corner_radius=0, **kwargs)
+            self._bg = fg_color
+            self._registry = registry
+            if registry is not None:
+                registry.append(self)
+            self._content_h = 0
+            self._anim_job = None
+            self._anim_start = 0.0
+            self._anim_target = 0.0
+            self._anim_t0 = 0.0
+            self._anim_dur = 0.18
+            self._visible_frac = 1.0
+
+            self.grid_rowconfigure(0, weight=1)
+            self.grid_columnconfigure(0, weight=1)
+
+            # Ojo: CTkFrame ya usa self._canvas para su fondo redondeado.
+            self._view = tk.Canvas(self, bg=fg_color, highlightthickness=0,
+                                   bd=0, relief="flat", takefocus=0)
+            self._view.grid(row=0, column=0, sticky="nsew")
+            self._scrollbar = ctk.CTkScrollbar(
+                self, orientation="vertical", width=10,
+                fg_color=fg_color, button_color=scrollbar_button_color,
+                button_hover_color="#4A5763", command=self._on_scrollbar)
+            self._scrollbar.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+            self.body = ctk.CTkFrame(self._view, fg_color=fg_color, corner_radius=0)
+            self._window = self._view.create_window((0, 0), window=self.body, anchor="nw")
+            self._view.configure(yscrollcommand=self._on_yview)
+            self._animating = False
+
+            self.body.bind("<Configure>", self._on_body_configure, add="+")
+            self._view.bind("<Configure>", self._on_view_configure, add="+")
+            self.bind("<Destroy>", self._on_destroy, add="+")
+
+        # ---- geometría ----
+        def _on_body_configure(self, _event=None):
+            self._content_h = max(1, self.body.winfo_reqheight())
+            self._view.configure(scrollregion=(0, 0, max(1, self.body.winfo_width()), self._content_h))
+            self._sync_scrollbar()
+
+        def _on_view_configure(self, event):
+            self._view.itemconfigure(self._window, width=max(1, event.width))
+            self._sync_scrollbar()
+
+        def _sync_scrollbar(self):
+            try:
+                need = self._content_h > self._view.winfo_height() + 2
+                if need and not self._scrollbar.winfo_ismapped():
+                    self._scrollbar.grid()
+                elif not need and self._scrollbar.winfo_ismapped():
+                    self._scrollbar.grid_remove()
+            except Exception:
+                pass
+
+        # ---- estado / animación ----
+        def _on_yview(self, first, last):
+            try:
+                self._scrollbar.set(first, last)
+            except Exception:
+                pass
+            self._visible_frac = max(0.0, float(last) - float(first))
+            if self._animating or self._anim_job is not None:
+                # El movimiento lo está produciendo nuestra animación: no hay
+                # que reescribir el destino con la posición intermedia.
+                return
+            # Movimiento externo (arrastre de la barra, resize, etc.).
+            self._anim_target = float(first)
+            self._anim_start = float(first)
+
+        def _on_scrollbar(self, *args):
+            self._cancel_anim()
+            self._view.yview(*args)
+            pos = self._view.yview()[0]
+            self._anim_target = float(pos)
+            self._anim_start = float(pos)
+
+        def _cancel_anim(self):
+            if self._anim_job is not None:
+                try:
+                    self.after_cancel(self._anim_job)
+                except Exception:
+                    pass
+                self._anim_job = None
+            self._animating = False
+
+        def at_bottom(self, tolerance=0.02):
+            try:
+                return self._view.yview()[1] >= 1.0 - tolerance
+            except Exception:
+                return True
+
+        def scroll_pixels(self, px):
+            if not self.winfo_ismapped():
+                return
+            height = self._view.winfo_height()
+            if self._content_h <= height + 2:
+                return
+            now = time.perf_counter()
+            current = float(self._view.yview()[0])
+            # Si la animación anterior ya terminó, se parte desde donde está.
+            if self._anim_job is None or now > self._anim_t0 + self._anim_dur + 0.05:
+                self._anim_target = current
+            frac = float(px) / max(1.0, float(self._content_h))
+            self._anim_target = max(0.0, min(1.0, self._anim_target + frac))
+            self._anim_start = current
+            self._anim_t0 = now
+            # Un solo gesto corto: mismo feel que los 180 ms de AutoSubs.
+            self._anim_dur = 0.12 if abs(px) < 40 else 0.19
+            if self._anim_job is None:
+                self._anim_job = self.after(8, self._anim_tick)
+
+        def scroll_to_top(self, animate=False):
+            self._cancel_anim()
+            try:
+                self._view.yview_moveto(0.0)
+                self._anim_target = 0.0
+                self._anim_start = 0.0
+            except Exception:
+                pass
+
+        def scroll_to_end(self):
+            if not self.winfo_ismapped():
+                return
+            now = time.perf_counter()
+            current = float(self._view.yview()[0])
+            self._cancel_anim()
+            self._anim_start = current
+            self._anim_target = 1.0
+            self._anim_t0 = now
+            self._anim_dur = 0.22
+            self._anim_job = self.after(8, self._anim_tick)
+
+        def _anim_tick(self):
+            self._anim_job = None
+            try:
+                elapsed = time.perf_counter() - self._anim_t0
+                p = 1.0 if self._anim_dur <= 0 else min(1.0, elapsed / self._anim_dur)
+                eased = 1.0 - (1.0 - p) ** 3   # cubic ease-out
+                pos = self._anim_start + (self._anim_target - self._anim_start) * eased
+                self._animating = True
+                try:
+                    self._view.yview_moveto(max(0.0, min(1.0, pos)))
+                finally:
+                    self._animating = False
+                if p < 1.0:
+                    self._anim_job = self.after(8, self._anim_tick)
+                else:
+                    # Si el lienzo recortó el destino (fin del contenido), se
+                    # sincroniza para que el próximo gesto arranque bien.
+                    real = float(self._view.yview()[0])
+                    self._anim_target = real
+                    self._anim_start = real
+            except Exception:
+                self._animating = False
+                self._anim_job = None
+
+        def _on_destroy(self, event):
+            if event.widget is not self:
+                return
+            self._cancel_anim()
+            if self._registry is not None:
+                try:
+                    self._registry.remove(self)
+                except ValueError:
+                    pass
 
     class App(ctk.CTk):
         def __init__(self, mode, url, batch=None, clip=None):
+            self._boot_t0 = time.perf_counter()
             super().__init__()
+            self._mark("super")
+            # La ventana se construye completa fuera de pantalla. Recién cuando
+            # todos los widgets están listos se muestra con un fade corto: no
+            # hay primer fotograma vacío ni textos de "cargando".
+            self.withdraw()
+            self._alpha_ok = True
+            try:
+                self.attributes("-alpha", 0.0)
+            except Exception:
+                self._alpha_ok = False
             self.cfg = load_cfg()
             self.batch = []
             self.batch_mode = False
@@ -1257,7 +1673,13 @@ def build_app():
             self._metadata_loading = set()
             self._metadata_generation = 0
             self._last_clip_url = None
-            self._gallery_dl_ok = self._check_gallery_dl()
+            self._last_site = None
+            self._logo_cache = {}
+            self._scroll_areas = []
+            self._bar_disp = {}
+            self._bar_target = {}
+            self._bar_jobs = {}
+            self._gallery_dl_ok = bool(self.cfg.get("gallery_dl_ok", True))
             self.stage = -1
             self.spin_i = 0
             self.t0 = time.time()
@@ -1276,6 +1698,7 @@ def build_app():
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=0)
             self.grid_rowconfigure(0, weight=1)
+            self._mark("geometry")
 
             left = ctk.CTkFrame(self, fg_color="#0D1116", corner_radius=0)
             left.grid(row=0, column=0, sticky="nsew")
@@ -1283,7 +1706,7 @@ def build_app():
             right.grid(row=0, column=1, sticky="nsew")
             right.grid_propagate(False)
 
-            self.hdr = ctk.CTkImage(halftone_header(1040, 120), size=(1040, 120))
+            self.hdr = ctk.CTkImage(cached_header(1040, 120), size=(1040, 120))
             hf = ctk.CTkFrame(left, fg_color="#0D1116", corner_radius=0, height=120)
             hf.pack(fill="x")
             hf.pack_propagate(False)
@@ -1293,7 +1716,12 @@ def build_app():
             band.pack_propagate(False)
             ctk.CTkLabel(band, text=spaced("DESCARGA VIDEOS, AUDIOS E IMÁGENES"), text_color=YEL,
                          font=(HEAVY, 15)).pack(expand=True)
+            self.status_pill = ctk.CTkLabel(
+                band, text="●  LISTO", text_color=GREEN, fg_color="#11181E",
+                corner_radius=10, font=(HEAVY, 10), height=24, width=94)
+            self.status_pill.place(relx=1.0, rely=0.5, x=-12, anchor="e")
             ctk.CTkFrame(left, fg_color=YEL, corner_radius=0, height=5).pack(fill="x")
+            self._mark("header")
 
             body = ctk.CTkFrame(left, fg_color="#0D1116", corner_radius=0)
             body.pack(fill="both", expand=True, padx=22, pady=(16, 14))
@@ -1303,46 +1731,65 @@ def build_app():
             self.form.grid_rowconfigure(0, weight=1)
             self.pv = ctk.CTkFrame(body, fg_color="#0D1116", corner_radius=0)
             self.build_form(url)
+            self._mark("form")
             self.build_progress()
+            self._mark("progress")
 
             hd = ctk.CTkFrame(right, fg_color="transparent")
             hd.pack(fill="x", padx=16, pady=(18, 8))
             self.r_title = ctk.CTkLabel(hd, text="▤  Historial", font=(HEAVY, 17), text_color=YEL)
             self.r_title.pack(side="left")
+            self.r_count = ctk.CTkLabel(hd, text="", font=(HEAVY, 10), text_color="#0D1116",
+                                        fg_color="#2A333D", corner_radius=8, height=20, width=26)
+            self.r_count.pack(side="left", padx=(8, 0))
             self.b_hist = ctk.CTkButton(hd, text="▤ HIST.", width=68, height=26, corner_radius=3,
                                         font=(HEAVY, 10), command=lambda: self.show_panel("hist"))
             self.b_live = ctk.CTkButton(hd, text="● EN VIVO", width=84, height=26, corner_radius=3,
                                         font=(HEAVY, 10), command=lambda: self.show_panel("live"))
             self.b_live.pack(side="right")
             self.b_hist.pack(side="right", padx=(0, 6))
-            self.rbar = ctk.CTkProgressBar(right, height=4, corner_radius=0, fg_color="#222", progress_color=YEL)
+            self.rbar = ctk.CTkProgressBar(right, height=4, corner_radius=2, fg_color="#1B2229",
+                                           progress_color=YEL)
             self.rbar.set(0)
             self.rbar.pack(fill="x", padx=16)
-            self.hist = ctk.CTkScrollableFrame(right, fg_color=BLACK, corner_radius=0, scrollbar_button_color="#333")
-            self.live = ctk.CTkScrollableFrame(right, fg_color=BLACK, corner_radius=0, scrollbar_button_color="#333")
+            self.hist = SmoothScroll(right, fg_color=BLACK, registry=self._scroll_areas,
+                                     scrollbar_button_color="#2B333C")
+            self.live = SmoothScroll(right, fg_color=BLACK, registry=self._scroll_areas,
+                                     scrollbar_button_color="#2B333C")
+            self._mark("scrolls")
             self.panel = None
             self.render_hist()
+            self._mark("hist")
             self.show_panel("hist")
 
             self.set_mode(self.cur_mode)
+            self._mark("setmode")
             if not self._gallery_dl_ok:
-                try:
-                    self.b_image.configure(state="disabled")
-                    self.b_image.configure(text="▧  IMAGEN (sin gallery-dl)")
-                except Exception:
-                    pass
+                self._apply_gallery_state(False, persist=False, notify=False)
             if batch:
                 self.enter_batch(batch)
             if clip:
                 self.after(500, lambda c=clip: self.apply_clip(c))
             self.bind("<Return>", lambda e: self.start() if self.form.winfo_ismapped() else None)
+            # Un único manejador global: la rueda funciona sobre cualquier hijo,
+            # sin depender de que CustomTkinter acierte el widget de destino.
+            self.bind_all("<MouseWheel>", self._on_wheel_all, add="+")
+            if sys.platform.startswith("linux"):
+                self.bind_all("<Button-4>", self._on_wheel_all, add="+")
+                self.bind_all("<Button-5>", self._on_wheel_all, add="+")
+            self.protocol("WM_DELETE_WINDOW", self._on_close)
             self.after(100, self.poll)
             self.after(120, self.tick)
+            self.after(0, self._reveal)
+            self.after(400, self._schedule_gallery_check)
+
+        def _mark(self, tag):
+            if os.environ.get("INDIEDL_PROFILE"):
+                log(f"boot {tag} {int((time.perf_counter() - self._boot_t0) * 1000)} ms")
 
         def _check_gallery_dl(self):
             try:
-                proc = subprocess.run(
-                    gallery_dl_command() + ["--version"],
+                proc = subprocess.run(                    gallery_dl_command() + ["--version"],
                     capture_output=True, timeout=10,
                     creationflags=NO_WINDOW, check=False,
                 )
@@ -1353,6 +1800,226 @@ def build_app():
             except Exception as exc:
                 log(f"gallery-dl no disponible: {exc!r}")
                 return False
+
+        # ---- arranque visual ----
+        def _reveal(self):
+            """Muestra la ventana ya armada, con un fade de ~150 ms."""
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            self._mark("idle")
+            try:
+                self.deiconify()
+                self._mark("deiconify")
+                self._apply_dark_titlebar()
+                self.lift()
+            except Exception:
+                pass
+            self._mark("lift")
+            if self._alpha_ok:
+                self._fade_in(0)
+            else:
+                self._finish_reveal()
+
+        def _fade_in(self, step):
+            # Pocos pasos a propósito: en Windows cada cambio de alfa repinta la
+            # ventana completa (~40 ms con el historial cargado). Tres avances
+            # se sienten igual de suaves y evitan medio segundo de espera.
+            steps = 4
+            p = min(1.0, float(step) / steps)
+            alpha = 1.0 - (1.0 - p) ** 3
+            try:
+                self.attributes("-alpha", alpha)
+            except Exception:
+                self._alpha_ok = False
+            if step < steps:
+                self.after(12, lambda: self._fade_in(step + 1))
+            else:
+                self._finish_reveal()
+
+        def _finish_reveal(self):
+            if getattr(self, "_revealed", False):
+                return
+            self._revealed = True
+            try:
+                self.attributes("-alpha", 1.0)
+            except Exception:
+                pass
+            try:
+                self.focus_force()
+            except Exception:
+                pass
+            # La ventana ya está visible y completa. El resto del historial se
+            # agrega en tandas de 16 ms, por debajo del área visible.
+            self.after(1, self._grow_hist)
+            log(f"UI lista en {int((time.perf_counter() - self._boot_t0) * 1000)} ms")
+
+        def _apply_dark_titlebar(self):
+            if os.name != "nt":
+                return
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                value = ctypes.c_int(1)
+                for attr in (20, 19):  # Win10/11: immersive dark mode
+                    if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                            hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                        break
+            except Exception:
+                pass
+
+        def _on_close(self):
+            try:
+                if getattr(self, "_hist_grow_job", None):
+                    self.after_cancel(self._hist_grow_job)
+            except Exception:
+                pass
+            self._hist_pending = None
+            for job in list(self._bar_jobs.values()):
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+            self._bar_jobs.clear()
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+        # ---- rueda global ----
+        def _wheel_target(self, x_root, y_root):
+            for area in reversed(self._scroll_areas):
+                try:
+                    if not area.winfo_ismapped():
+                        continue
+                    x, y = area.winfo_rootx(), area.winfo_rooty()
+                    if x <= x_root < x + area.winfo_width() and \
+                            y <= y_root < y + area.winfo_height():
+                        return area
+                except Exception:
+                    continue
+            return None
+
+        def _on_wheel_all(self, event):
+            try:
+                target = self._wheel_target(event.x_root, event.y_root)
+                if target is None:
+                    return None
+                # Un Text/Listbox propio conserva su scroll nativo.
+                try:
+                    widget = self.winfo_containing(event.x_root, event.y_root)
+                    if widget is not None and widget.winfo_class() in ("Text", "Listbox", "TCombobox"):
+                        return None
+                except Exception:
+                    pass
+                if getattr(event, "num", None) in (4, 5):
+                    px = -44.0 if event.num == 4 else 44.0
+                else:
+                    delta = float(getattr(event, "delta", 0) or 0)
+                    if delta == 0:
+                        return None
+                    px = -delta * 0.48
+                target.scroll_pixels(px)
+                return "break"
+            except Exception:
+                return None
+
+        # ---- gallery-dl sin bloquear el arranque ----
+        def _schedule_gallery_check(self):
+            checked = float(self.cfg.get("gallery_dl_checked") or 0)
+            has_cache = "gallery_dl_ok" in self.cfg
+            if has_cache:
+                self._apply_gallery_state(bool(self.cfg.get("gallery_dl_ok")),
+                                          persist=False, notify=False)
+                if time.time() - checked < 6 * 3600:
+                    return
+
+            def worker():
+                ok = self._check_gallery_dl()
+                self.after(0, lambda: self._apply_gallery_state(ok, persist=True, notify=True))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _apply_gallery_state(self, ok, persist=True, notify=True):
+            changed = bool(ok) != bool(self._gallery_dl_ok)
+            self._gallery_dl_ok = bool(ok)
+            try:
+                if ok:
+                    self.b_image.configure(state="normal", text="▧  IMAGEN")
+                else:
+                    self.b_image.configure(state="disabled", text="▧  IMAGEN (sin gallery-dl)")
+                    if self.cur_mode == "image":
+                        self.set_mode("video")
+            except Exception:
+                pass
+            if persist:
+                try:
+                    self.cfg["gallery_dl_ok"] = bool(ok)
+                    self.cfg["gallery_dl_checked"] = time.time()
+                    save_cfg(self.cfg)
+                except Exception:
+                    pass
+            if notify and changed:
+                log("gallery-dl disponible" if ok else "gallery-dl no disponible")
+
+        # ---- pequeños estados visuales ----
+        def _set_status(self, text, color):
+            try:
+                self.status_pill.configure(text=text, text_color=color)
+            except Exception:
+                pass
+
+        def _set_bar_smooth(self, bar, target):
+            try:
+                target = max(0.0, min(1.0, float(target)))
+            except Exception:
+                return
+            self._bar_target[bar] = target
+            if bar in self._bar_jobs:
+                return
+
+            def tick():
+                try:
+                    current = self._bar_disp.get(bar, 0.0)
+                    goal = self._bar_target.get(bar, target)
+                    nxt = current + (goal - current) * 0.32
+                    if abs(goal - nxt) < 0.004:
+                        nxt = goal
+                    self._bar_disp[bar] = nxt
+                    bar.set(nxt)
+                    if nxt != goal:
+                        self._bar_jobs[bar] = self.after(16, tick)
+                    else:
+                        self._bar_jobs.pop(bar, None)
+                except Exception:
+                    self._bar_jobs.pop(bar, None)
+
+            self._bar_jobs[bar] = self.after(16, tick)
+
+        def _set_rbar(self, value):
+            self._set_bar_smooth(self.rbar, value)
+
+        def _reset_bars(self):
+            for job in list(self._bar_jobs.values()):
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+            self._bar_jobs.clear()
+            self._bar_disp.clear()
+            self._bar_target.clear()
+            for row in getattr(self, "rows", []):
+                try:
+                    row["bar"].stop()
+                    row["bar"].set(0)
+                    row["bar"].place_forget()
+                except Exception:
+                    pass
+            try:
+                self.rbar.set(0)
+            except Exception:
+                pass
 
         def build_form(self, url):
             # La columna izquierda agrupa enlace y vista previa. La derecha
@@ -1469,7 +2136,7 @@ def build_app():
                 ctk.CTkCheckBox(op, text=text, variable=var, text_color=WHITE, font=("Segoe UI Semibold", 12),
                                 fg_color=YEL, hover_color=YEL_H, border_color=BLACK, checkmark_color=BLACK,
                                 border_width=2, corner_radius=3, checkbox_width=20,
-                                checkbox_height=20).pack(side="left", padx=(0, 12))
+                                checkbox_height=20).pack(anchor="w", pady=2)
 
             sep(7)
             self.v_clip = ctk.BooleanVar(value=False)
@@ -1513,19 +2180,26 @@ def build_app():
                 ic = ctk.CTkFrame(r, width=30, height=30, corner_radius=15, fg_color="#DDD")
                 ic.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, 12))
                 ic.pack_propagate(False)
-                il = ctk.CTkLabel(ic, text="", font=(HEAVY, 13), text_color=WHITE, fg_color="transparent")
+                il = ctk.CTkLabel(ic, text="", font=(HEAVY, 14), text_color=WHITE, fg_color="transparent")
                 il.pack(expand=True)
                 tx = ctk.CTkLabel(r, text=name, font=("Segoe UI Semibold", 15), text_color="#999", anchor="w")
                 tx.grid(row=0, column=1, sticky="w", pady=(4, 0))
                 pc = ctk.CTkLabel(r, text="", font=(HEAVY, 13), text_color=WHITE)
                 pc.grid(row=0, column=2, sticky="e")
-                bar = ctk.CTkProgressBar(r, height=10, corner_radius=0, fg_color="#E2E2E2", progress_color=BLACK,
-                                         border_width=2, border_color=BLACK, mode="determinate")
+                # La pista queda siempre en el layout: al aparecer la barra de
+                # un paso, los demás no saltan de posición.
+                track = ctk.CTkFrame(r, fg_color="transparent", height=10)
+                track.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0))
+                track.grid_propagate(False)
+                bar = ctk.CTkProgressBar(track, height=7, corner_radius=3, fg_color="#1E262E",
+                                         progress_color=YEL, border_width=0, mode="determinate")
+                bar.place(relx=0, rely=0.5, relwidth=1, anchor="w")
                 bar.set(0)
+                bar.place_forget()
                 ln = ctk.CTkFrame(r, width=2, height=18, fg_color="#CCC", corner_radius=0)
                 if i < len(STAGES) - 1:
                     ln.grid(row=2, column=0, pady=(2, 0))
-                self.rows.append(dict(ic=ic, il=il, tx=tx, pc=pc, bar=bar, name=name))
+                self.rows.append(dict(ic=ic, il=il, tx=tx, pc=pc, bar=bar, track=track, name=name))
 
             st = ctk.CTkFrame(self.pv, fg_color="transparent")
             st.pack(fill="x", pady=14)
@@ -1564,38 +2238,56 @@ def build_app():
             for i, b in enumerate(order):
                 b.grid(row=0, column=i, sticky="ew", padx=(0, 6) if i == 0 else (6, 0))
 
+        def _show_row_bar(self, row, mode="indeterminate", reset=False):
+            bar = row["bar"]
+            try:
+                bar.stop()
+                bar.configure(mode=mode)
+                if mode == "determinate":
+                    bar.set(0 if reset else self._bar_disp.get(bar, 0.0))
+                if not bar.winfo_ismapped():
+                    bar.place(relx=0, rely=0.5, relwidth=1, anchor="w")
+                if mode == "indeterminate":
+                    bar.start()
+            except Exception:
+                pass
+
+        def _hide_row_bar(self, row):
+            try:
+                row["bar"].stop()
+                row["bar"].place_forget()
+            except Exception:
+                pass
+
         def set_stage(self, idx, text=None):
             self.stage = idx
             for i, r in enumerate(self.rows):
                 if i < idx:
-                    r["bar"].stop()
-                    r["bar"].grid_forget()
-                    r["ic"].configure(fg_color=YEL)
-                    r["il"].configure(text="✓", text_color=BLACK)
+                    self._hide_row_bar(r)
+                    r["ic"].configure(fg_color=YEL, border_width=0)
+                    r["il"].configure(text="✓", text_color=BLACK, font=(HEAVY, 14))
                     r["tx"].configure(text=r["name"], text_color=WHITE, font=("Segoe UI Semibold", 15))
                     r["pc"].configure(text="")
                 elif i == idx:
-                    r["ic"].configure(fg_color=BLACK)
-                    r["il"].configure(text=SPIN[0], text_color=YEL)
+                    r["ic"].configure(fg_color="#0D1116", border_width=2, border_color=YEL)
+                    r["il"].configure(text=SPIN[0], text_color=YEL, font=(HEAVY, 15))
                     r["tx"].configure(text=text or r["name"], text_color=WHITE, font=(HEAVY, 15))
-                    r["bar"].grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 4))
-                    r["bar"].stop()
-                    if i == 1:
-                        r["bar"].configure(mode="determinate")
-                        r["bar"].set(0)
-                    else:
-                        r["bar"].configure(mode="indeterminate")
-                        r["bar"].start()
+                    r["pc"].configure(text="")
+                    # El paso 2 tiene porcentaje real; el resto usa una barra
+                    # indeterminada. Ambas viven dentro de una pista de altura
+                    # fija, así que los demás pasos no se mueven.
+                    self._show_row_bar(r, "determinate" if i == 1 else "indeterminate", reset=True)
                 else:
-                    r["bar"].stop()
-                    r["bar"].grid_forget()
-                    r["ic"].configure(fg_color="#DDD")
-                    r["il"].configure(text="")
+                    self._hide_row_bar(r)
+                    r["ic"].configure(fg_color="#DDD", border_width=0)
+                    r["il"].configure(text="", font=(HEAVY, 14))
                     r["tx"].configure(text=r["name"], text_color="#999", font=("Segoe UI Semibold", 15))
                     r["pc"].configure(text="")
-            if idx < len(STAGES):
+            if 0 <= idx < len(STAGES):
                 self.p_top.configure(text=f"{self._prefix}PASO {idx + 1} DE {len(STAGES)}")
                 self.p_title.configure(text=text or STAGES[idx])
+            if idx >= 1:
+                self._set_rbar((idx + 0.35) / max(1, len(STAGES)))
 
         def tick(self):
             if self.busy and 0 <= self.stage < len(STAGES):
@@ -1613,6 +2305,9 @@ def build_app():
             return f
 
         def make_platform_logo(self, site):
+            cached = self._logo_cache.get(site)
+            if cached is not None:
+                return cached
             from PIL import Image, ImageDraw, ImageFont
             size = 112
             palette = {
@@ -1646,25 +2341,43 @@ def build_app():
                 d.text((x, y-1), "P", font=font, fill=bg)
             else:
                 d.text((x, y), mark, font=font, fill=fg)
-            return ctk.CTkImage(light_image=im, dark_image=im, size=(56, 56))
+            image = ctk.CTkImage(light_image=im, dark_image=im, size=(56, 56))
+            self._logo_cache[site] = image
+            return image
 
         def on_url(self):
             url = self.url.get().strip()
             site = site_name(url) if url else "LINK"
             icons = {"YOUTUBE": ("▶", "YouTube"), "INSTAGRAM": ("◎", "Instagram"), "TIKTOK": ("♪", "TikTok"), "X": ("𝕏", "X / Twitter"), "PINTEREST": ("ℙ", "Pinterest"), "LINK": ("↗", "Plataforma")}
             ico, label = icons.get(site, ("↗", "Plataforma"))
-            self.chip.configure(text=f"{ico}  {label}")
+            if site != self._last_site:
+                self._last_site = site
+                self.chip.configure(text=f"{ico}  {label}")
+                if hasattr(self, "platform_icon"):
+                    self.platform_icon.configure(image=self.make_platform_logo(site), text="")
+            valid = bool(url and clean_url(url))
             if hasattr(self, "platform_icon"):
-                self.platform_icon.configure(image=self.make_platform_logo(site), text="")
-                self.preview_title.configure(text="Cargando información…" if url else "Esperando un enlace")
-                self.preview_meta.configure(text=f"{label} · enlace recibido · preparando vista previa" if url else "Pegá un enlace para detectar plataforma y detalles")
-                self.thumbnail_label.configure(image=None, text="Cargando…" if url else "Sin enlace")
+                # Nunca se escribe "Cargando…": el panel ya está completo y los
+                # datos reales entran en segundo plano sin tapar el contenido.
+                if not url:
+                    self.preview_title.configure(text="Esperando un enlace")
+                    self.preview_meta.configure(text="Pegá un enlace para detectar plataforma y detalles")
+                    self.thumbnail_label.configure(image=None, text="Sin enlace")
+                elif valid:
+                    self.preview_title.configure(text="Contenido listo para descargar")
+                    self.preview_meta.configure(text=f"{label} · enlace recibido")
+                    self.thumbnail_label.configure(image=None, text="")
+                else:
+                    self.preview_title.configure(text="Enlace no compatible")
+                    self.preview_meta.configure(text="Usá un enlace de YouTube, Instagram, TikTok, X o Pinterest")
+                    self.thumbnail_label.configure(image=None, text="")
                 self.thumbnail_image = None
                 if self._meta_job:
                     try: self.after_cancel(self._meta_job)
                     except Exception: pass
-                if url and clean_url(url):
-                    self._meta_job = self.after(350, lambda u=url: self.fetch_metadata(u))
+                if valid:
+                    delay = 0 if url in self._metadata_cache else 350
+                    self._meta_job = self.after(delay, lambda u=url: self.fetch_metadata(u))
             if self._last_clip_url != url:
                 self._last_clip_url = url
                 if hasattr(self, "v_clip") and self.v_clip.get():
@@ -1713,6 +2426,7 @@ def build_app():
                     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
                             "socket_timeout": 10, "retries": 0, "extractor_retries": 0,
                             "paths": {"temp": str(TEMP_DIR)}}
+                    opts.update(yt_cookie_opts(url))
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                     self._metadata_cache[url] = info
@@ -1827,16 +2541,17 @@ def build_app():
         def configure_cookies(self):
             win = ctk.CTkToplevel(self)
             win.title("IndieDL · Sesión de Instagram")
-            win.geometry("500x300")
+            win.geometry("560x340")
             win.resizable(False, False)
             win.transient(self)
             win.grab_set()
             win.configure(fg_color=BLACK)
             ctk.CTkLabel(win, text="SESIÓN DEL NAVEGADOR", font=(HEAVY, 18), text_color=YEL).pack(
                 anchor="w", padx=22, pady=(20, 6))
-            ctk.CTkLabel(win, text="Elegí dónde tenés iniciada la sesión de Instagram.\nEn una PC nueva, iniciá sesión primero en ese navegador.",
+            ctk.CTkLabel(win, text="IndieDL busca tu sesión de Instagram solo (DETECTAR AUTO).\nSi no puede, exportá un cookies.txt de instagram.com\ny cargalo con COOKIES.TXT.",
                          font=("Segoe UI", 12), text_color=GRAY, justify="left").pack(anchor="w", padx=22, pady=(0, 14))
             labels = {"Auto (recomendado)": "auto", "Zen Browser": "zen", "Firefox": "firefox",
+                      "Helium Browser": "helium",
                       "Google Chrome": "chrome", "Microsoft Edge": "edge", "Brave": "brave"}
             current = str(self.cfg.get("cookies_browser", "auto") or "auto").lower()
             reverse = {v: k for k, v in labels.items()}
@@ -1855,15 +2570,61 @@ def build_app():
                 save_cfg(self.cfg)
                 try:
                     browser, profile = cookie_source(self.cfg)
-                    status.configure(text=(f"Guardado. Se usará {browser} con perfil detectado." if profile else
+                    resolved_name = "Helium Browser" if choice == "helium" else browser
+                    status.configure(text=(f"Guardado. Se usará {resolved_name} con perfil detectado." if profile else
                                            f"Guardado. Se usará {browser or 'acceso sin sesión'} con detección automática."), text_color=GREEN)
                     log(f"Preferencia de cookies guardada: {choice}; navegador resuelto={browser or 'ninguno'}; perfil_detectado={'sí' if profile else 'no'}")
                 except Exception as exc:
                     status.configure(text=f"Preferencia guardada, pero falta configurar la sesión: {exc}", text_color=RED)
                 self.after(1800, win.destroy)
-            ctk.CTkButton(buttons, text="GUARDAR", height=38, fg_color=YEL, hover_color=YEL_H,
-                          text_color=BLACK, font=(HEAVY, 12), command=save_choice).pack(side="right")
-            ctk.CTkButton(buttons, text="CANCELAR", height=38, fg_color="#252C33", hover_color="#343D46",
+            def import_cookies_txt():
+                from tkinter import filedialog
+                f = filedialog.askopenfilename(parent=win, title="Elegí el cookies.txt de instagram.com",
+                                               filetypes=[("cookies.txt", "*.txt"), ("Todos", "*.*")])
+                if not f:
+                    return
+                try:
+                    txt = Path(f).read_text(encoding="utf-8-sig", errors="replace")
+                    raw = txt.strip().strip('"').strip("'")
+                    if raw.lower().startswith("sessionid="):
+                        raw = raw.split("=", 1)[1].strip()
+                    if re.fullmatch(r"[A-Za-z0-9%._:\-]{20,}", raw):
+                        # El archivo trae solo el valor de sessionid: armo el cookies.txt completo.
+                        import time as _t
+                        exp = int(_t.time()) + 365 * 24 * 3600
+                        uid = raw.replace("%3A", ":").split(":")[0]
+                        rows = ["# Netscape HTTP Cookie File",
+                                f".instagram.com\tTRUE\t/\tTRUE\t{exp}\tsessionid\t{raw}"]
+                        if uid.isdigit():
+                            rows.append(f".instagram.com\tTRUE\t/\tTRUE\t{exp}\tds_user_id\t{uid}")
+                        txt = "\n".join(rows) + "\n"
+                    if "instagram.com" not in txt or "sessionid" not in txt:
+                        status.configure(text="Ese archivo no tiene la cookie 'sessionid' de instagram.com. "
+                                              "Exportalo estando logueado en Instagram.", text_color=RED)
+                        return
+                    APP_DIR.mkdir(parents=True, exist_ok=True)
+                    COOKIES_FILE.write_text(txt, encoding="utf-8")
+                    status.configure(text="cookies.txt guardado. Ya no hace falta cerrar el navegador.", text_color=GREEN)
+                    self.after(1800, win.destroy)
+                except Exception as exc:
+                    status.configure(text=f"No pude guardar el archivo: {exc}", text_color=RED)
+            def detect_here():
+                status.configure(text="Buscando tu sesión de Instagram…", text_color=GRAY)
+
+                def done(ok, st="", info=""):
+                    if ok:
+                        status.configure(text=f"Sesión detectada en {BROWSER_PRETTY.get(info, info)}. Listo.", text_color=GREEN)
+                        self.after(1600, win.destroy)
+                    else:
+                        status.configure(text=auto_fail_text(st, info), text_color=RED)
+                self.auto_detect_session(done, True, win)
+            ctk.CTkButton(buttons, text="DETECTAR AUTO", height=38, width=112, fg_color=YEL, hover_color=YEL_H,
+                          text_color=BLACK, font=(HEAVY, 11), command=detect_here).pack(side="left")
+            ctk.CTkButton(buttons, text="COOKIES.TXT", height=38, width=104, fg_color="#252C33", hover_color="#343D46",
+                          text_color=WHITE, font=(HEAVY, 11), command=import_cookies_txt).pack(side="left", padx=(8, 0))
+            ctk.CTkButton(buttons, text="GUARDAR", height=38, width=90, fg_color="#252C33", hover_color="#343D46",
+                          text_color=WHITE, font=(HEAVY, 11), command=save_choice).pack(side="right")
+            ctk.CTkButton(buttons, text="CANCELAR", height=38, width=90, fg_color="#252C33", hover_color="#343D46",
                           text_color=WHITE, font=(HEAVY, 12), command=win.destroy).pack(side="right", padx=(0, 8))
 
         def set_mode(self, m):
@@ -1887,6 +2648,38 @@ def build_app():
                 self.menu.set("Original")
             self._sync_clip_controls()
 
+        def auto_detect_session(self, on_done=None, allow_prompt=True, parent=None):
+            parent = parent or self
+            self.msg.configure(text="Buscando tu sesión de Instagram en los navegadores…")
+
+            def worker():
+                res = import_instagram_cookies_auto(self.cfg)
+                self.after(0, lambda r=res: self._auto_session_result(r, on_done, allow_prompt, parent))
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _auto_session_result(self, res, on_done, allow_prompt, parent):
+            ok, status, info = res
+            self.msg.configure(text="Sesión de Instagram detectada." if ok else "")
+            if ok:
+                if on_done:
+                    on_done(True, status, info)
+                return
+            if status == "locked" and allow_prompt:
+                names = running_browser_processes(info)
+                pretty = BROWSER_PRETTY.get(info, info)
+                if names and messagebox.askyesno(
+                        "IndieDL · Sesión de Instagram",
+                        f"{pretty} está abierto y bloquea sus cookies.\n\n"
+                        f"¿Querés que IndieDL lo cierre para leer tu sesión?\n"
+                        f"(Guardá lo que tengas abierto; normalmente las pestañas se restauran al volver a abrirlo.)",
+                        parent=parent):
+                    close_browser_processes(names)
+                    self.msg.configure(text="Leyendo la sesión…")
+                    self.after(2500, lambda: self.auto_detect_session(on_done, False, parent))
+                    return
+            if on_done:
+                on_done(False, status, info)
+
         def begin_image_selection(self, url, folder, quality):
             if self._image_dialog is not None:
                 try:
@@ -1894,6 +2687,11 @@ def build_app():
                     return
                 except Exception:
                     self._image_dialog = None
+            if ("instagram.com" in url.lower() and not cookies_file_path(self.cfg)
+                    and not getattr(self, "_ig_auto_attempted", False)):
+                self._ig_auto_attempted = True
+                self.auto_detect_session(lambda ok, *a: self.begin_image_selection(url, folder, quality))
+                return
             self.msg.configure(text="Analizando imágenes del carrusel…")
 
             def worker():
@@ -1916,14 +2714,32 @@ def build_app():
                 except Exception as exc:
                     msg = str(exc).replace("ERROR: ", "")[:300]
                     log(f"image selection {url}: {exc!r}")
-                    self.after(0, lambda m=msg: self.image_selection_error(m))
+                    self.after(0, lambda m=msg: self.image_selection_error(m, (url, folder, quality)))
 
             threading.Thread(target=worker, daemon=True).start()
 
-        def image_selection_error(self, message):
+        def image_selection_error(self, message, ctx=None):
             self.msg.configure(text="No se pudo leer el carrusel. Revisá la sesión/cookies de Instagram.")
-            messagebox.showerror("IndieDL · Imágenes", message or "No se encontraron imágenes accesibles.", parent=self)
             self._image_dialog = None
+            low = (message or "").lower()
+            needs_session = any(w in low for w in ("permission denied", "login", "cookie", "401", "403",
+                                                   "checkpoint", "challenge", "decrypt", "rate", "429"))
+            if needs_session:
+                ask = messagebox.askyesno(
+                    "IndieDL · Imágenes",
+                    (message or "No se encontraron imágenes accesibles.")[:500] +
+                    "\n\nInstagram necesita una sesión válida.\n"
+                    "¿Querés que IndieDL la busque automáticamente en tus navegadores?",
+                    parent=self)
+                if ask:
+                    def after(ok, *a):
+                        if ok and ctx:
+                            self.begin_image_selection(*ctx)
+                        elif not ok:
+                            self.configure_cookies()
+                    self.auto_detect_session(after)
+            else:
+                messagebox.showerror("IndieDL · Imágenes", message or "No se encontraron imágenes accesibles.", parent=self)
 
         def show_image_selector(self, url, folder, quality, info, entries):
             self.msg.configure(text="")
@@ -1931,24 +2747,34 @@ def build_app():
             self._image_dialog = win
             is_carousel = len(entries) > 1
             win.title("IndieDL · Seleccionar imágenes" if is_carousel else "IndieDL · Imagen individual")
-            win.geometry("700x620" if is_carousel else "620x430")
+            w, h = (700, 620) if is_carousel else (620, 430)
+            win.geometry(f"{w}x{h}")
             win.minsize(560, 420)
             win.transient(self)
             win.grab_set()
             win.configure(fg_color=BLACK)
+            # Centrada sobre la ventana principal, sin el salto de aparecer
+            # primero en una esquina.
+            try:
+                x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
+                y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)
+                win.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                pass
             heading = "CARRUSEL DE IMÁGENES" if is_carousel else "IMAGEN INDIVIDUAL"
             ctk.CTkLabel(win, text=heading, font=(HEAVY, 18), text_color=YEL).pack(anchor="w", padx=18, pady=(16, 4))
             instruction = (f"{len(entries)} imágenes detectadas. Elegí una o varias, o descargá todas."
                            if is_carousel else "Se detectó una imagen. Revisá los datos y descargala en calidad original disponible.")
             ctk.CTkLabel(win, text=instruction,
                          font=("Segoe UI", 12), text_color=GRAY).pack(anchor="w", padx=18, pady=(0, 12))
-            scroll = ctk.CTkScrollableFrame(win, fg_color="#10151A", corner_radius=10)
+            scroll = SmoothScroll(win, fg_color="#10151A", registry=self._scroll_areas,
+                                  scrollbar_button_color="#2B333C")
             scroll.pack(fill="both", expand=True, padx=16, pady=(0, 12))
             vars_ = []
             thumb_refs = []
             self._carousel_thumb_refs = thumb_refs
             for idx, entry in enumerate(entries, start=1):
-                row = ctk.CTkFrame(scroll, fg_color="#1A2026", corner_radius=8)
+                row = ctk.CTkFrame(scroll.body, fg_color="#1A2026", corner_radius=8)
                 row.pack(fill="x", padx=4, pady=4)
                 var = ctk.BooleanVar(value=True)
                 vars_.append(var)
@@ -2045,42 +2871,146 @@ def build_app():
             uns = dict(fg_color="#222", hover_color="#333", text_color=WHITE)
             self.b_live.configure(**(sel if which == "live" else uns))
             self.b_hist.configure(**(sel if which == "hist" else uns))
+            self._update_hist_count()
+            if which == "live":
+                self.after(30, self.live.scroll_to_end)
 
         def add_log(self, text):
+            at_bottom = self.live.at_bottom()
             t = int(time.time() - self.t0)
-            f = ctk.CTkFrame(self.live, fg_color="transparent")
+            f = ctk.CTkFrame(self.live.body, fg_color="transparent")
             f.pack(fill="x")
             ctk.CTkLabel(f, text=f"{t // 3600:02d}:{t % 3600 // 60:02d}:{t % 60:02d}", font=("Consolas", 10),
                          text_color="#777", anchor="w").pack(fill="x", padx=8, pady=(8, 0))
             ctk.CTkLabel(f, text=text, font=("Segoe UI", 12), text_color=WHITE, anchor="w", justify="left",
                          wraplength=240).pack(fill="x", padx=8, pady=(0, 8))
             ctk.CTkFrame(f, fg_color="#222", height=1, corner_radius=0).pack(fill="x")
-            self.after(30, lambda: self.live._parent_canvas.yview_moveto(1.0))
+            if at_bottom:
+                self.after(30, self.live.scroll_to_end)
+
+        def _update_hist_count(self):
+            try:
+                n = len(self.cfg.get("history", []))
+                self.r_count.configure(text=str(n),
+                                       text_color="#0D1116" if n else "#7C8792",
+                                       fg_color="#2A333D" if n else "transparent")
+            except Exception:
+                pass
+
+        def _hist_card(self, it, parent=None):
+            parent = parent or self.hist.body
+            f = ctk.CTkFrame(parent, fg_color="#151B21", border_width=1,
+                             border_color="#303942", corner_radius=10, cursor="hand2")
+            t = it.get("title", "")
+            l1 = ctk.CTkLabel(f, text=(t[:46] + "...") if len(t) > 46 else t, text_color=WHITE,
+                              font=("Segoe UI Semibold", 12), anchor="w", justify="left", wraplength=240)
+            l1.pack(fill="x", padx=10, pady=(8, 0))
+            site_icons = {"YOUTUBE":"▶", "INSTAGRAM":"◎", "TIKTOK":"♪", "X":"𝕏", "PINTEREST":"ℙ", "LINK":"↗"}
+            icon = site_icons.get(it.get("site", "LINK"), "↗")
+            txt = f'{icon}  {it.get("mode", "").upper()}  ·  {it.get("site", "")}  ·  {it.get("when", "")}'
+            l2 = ctk.CTkLabel(f, text=txt, text_color=GRAY, font=("Segoe UI", 10), anchor="w", justify="left")
+            l2.pack(fill="x", padx=10, pady=(0, 8))
+
+            def hover_on(_e=None):
+                try:
+                    f.configure(fg_color="#1A2229", border_color="#3B4652")
+                except Exception:
+                    pass
+
+            def hover_off(_e=None):
+                def check():
+                    try:
+                        x, y = f.winfo_pointerxy()
+                        rx, ry = f.winfo_rootx(), f.winfo_rooty()
+                        if not (rx <= x < rx + f.winfo_width() and
+                                ry <= y < ry + f.winfo_height()):
+                            f.configure(fg_color="#151B21", border_color="#303942")
+                    except Exception:
+                        pass
+                self.after(24, check)
+
+            for widget in (f, l1, l2):
+                widget.bind("<Enter>", hover_on, add="+")
+                widget.bind("<Leave>", hover_off, add="+")
+            folder = it.get("folder", "")
+            if folder:
+                for widget in (f, l1, l2):
+                    widget.bind("<Button-1>", lambda e, p=folder: self.open_dir(p))
+            return f
 
         def render_hist(self):
-            for w in self.hist.winfo_children():
+            """Dibuja las primeras tarjetas del historial y deja el resto en cola.
+
+            Crear 50 tarjetas antes de mostrar la ventana costaba ~300 ms y
+            obligaba a pintar cientos de widgets en el primer fotograma. Con
+            las primeras 10 la ventana abre al instante; el resto se agrega en
+            silencio justo después del fade, sin indicadores ni saltos.
+            """
+            for w in self.hist.body.winfo_children():
                 w.destroy()
-            items = self.cfg.get("history", [])
-            if not items:
-                ctk.CTkLabel(self.hist, text="Tus descargas aparecerán acá", text_color="#777",
-                             font=("Segoe UI", 12), wraplength=240).pack(pady=60)
+            self._hist_cards = []
+            self._hist_empty = None
+            self._hist_items = list(self.cfg.get("history", []))
+            if not self._hist_items:
+                self._hist_empty = ctk.CTkLabel(
+                    self.hist.body, text="Tus descargas aparecerán acá", text_color="#777",
+                    font=("Segoe UI", 12), wraplength=240)
+                self._hist_empty.pack(pady=60)
+                self._update_hist_count()
                 return
-            for it in items:
-                f = ctk.CTkFrame(self.hist, fg_color="#151B21", border_width=1, border_color="#303942", corner_radius=10, cursor="hand2")
-                f.pack(fill="x", pady=4)
-                t = it.get("title", "")
-                l1 = ctk.CTkLabel(f, text=(t[:46] + "...") if len(t) > 46 else t, text_color=WHITE,
-                                  font=("Segoe UI Semibold", 12), anchor="w", justify="left", wraplength=240)
-                l1.pack(fill="x", padx=10, pady=(8, 0))
-                site_icons = {"YOUTUBE":"▶", "INSTAGRAM":"◎", "TIKTOK":"♪", "X":"𝕏", "PINTEREST":"ℙ", "LINK":"↗"}
-                icon = site_icons.get(it.get("site", "LINK"), "↗")
-                txt = f'{icon}  {it.get("mode", "").upper()}  ·  {it.get("site", "")}  ·  {it.get("when", "")}'
-                l2 = ctk.CTkLabel(f, text=txt, text_color=GRAY, font=("Segoe UI", 10), anchor="w", justify="left")
-                l2.pack(fill="x", padx=10, pady=(0, 8))
-                folder = it.get("folder", "")
-                if folder:
-                    for w in (f, l1, l2):
-                        w.bind("<Button-1>", lambda e, p=folder: self.open_dir(p))
+            self._hist_pending = self._hist_items[10:]
+            for it in self._hist_items[:10]:
+                card = self._hist_card(it)
+                card.pack(fill="x", pady=4)
+                self._hist_cards.append(card)
+            self._update_hist_count()
+            self.hist.scroll_to_top()
+
+        def _grow_hist(self):
+            """Agrega las tarjetas restantes en tandas cortas (sin bloquear)."""
+            try:
+                if not self.winfo_exists():
+                    return
+            except Exception:
+                return
+            pending = getattr(self, "_hist_pending", None)
+            if not pending:
+                self._hist_pending = None
+                return
+            for it in pending[:12]:
+                card = self._hist_card(it)
+                card.pack(fill="x", pady=4)
+                self._hist_cards.append(card)
+            self._hist_pending = pending[12:]
+            if self._hist_pending:
+                self._hist_grow_job = self.after(16, self._grow_hist)
+            else:
+                self._hist_pending = None
+                self._hist_grow_job = None
+
+        def prepend_hist(self, item):
+            if self._hist_empty is not None:
+                try:
+                    self._hist_empty.destroy()
+                except Exception:
+                    pass
+                self._hist_empty = None
+            card = self._hist_card(item)
+            cards = getattr(self, "_hist_cards", [])
+            if cards:
+                card.pack(fill="x", pady=4, before=cards[0])
+            else:
+                card.pack(fill="x", pady=4)
+            cards.insert(0, card)
+            self._hist_cards = cards
+            while len(cards) > 50:
+                old = cards.pop()
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
+            self._update_hist_count()
+            self.hist.scroll_to_top()
 
         def start(self):
             if self.busy:
@@ -2144,6 +3074,8 @@ def build_app():
             self.show_buttons("run")
             self.btn.configure(state="disabled", text="DESCARGANDO LOTE...")
             self.t0 = time.time()
+            self._reset_bars()
+            self._set_status("●  DESCARGANDO", YEL)
             self.set_stage(0, "Conectando…")
             for key in self.stat:
                 self.stat[key].configure(text="-")
@@ -2175,6 +3107,8 @@ def build_app():
             self.pv.pack(fill="both", expand=True)
             self.btn.configure(state="disabled", text="DESCARGANDO...")
             self.t0 = time.time()
+            self._reset_bars()
+            self._set_status("●  DESCARGANDO", YEL)
             self.set_stage(0, "Conectando…")
             for key in self.stat:
                 self.stat[key].configure(text="-")
@@ -2227,6 +3161,8 @@ def build_app():
             self.show_buttons("run")
             self.btn.configure(state="normal", text="⬇  DESCARGAR")
             self.set_stage(-1)
+            self._reset_bars()
+            self._set_status("●  LISTO", GREEN)
             self.msg.configure(text="")
             self.url.focus()
 
@@ -2242,8 +3178,10 @@ def build_app():
                         _, p, sp, eta, dl, tot, n, total = ev
                         if 0 <= self.stage < len(self.rows):
                             bar = self.rows[self.stage]["bar"]
-                            if self.stage == 1 and bar.cget("mode") == "determinate":
-                                bar.set(p)
+                            if self.stage == 1:
+                                self._set_bar_smooth(bar, p)
+                                self.rows[self.stage]["pc"].configure(text=f"{int(round(max(0.0, min(1.0, p)) * 100))}%")
+                            self._set_rbar((self.stage + max(0.0, min(1.0, p))) / max(1, len(STAGES)))
                         self.stat["sp"].configure(text=fb(sp) + "/s" if sp else "-")
                         self.stat["eta"].configure(text=ft(eta) if eta else "-")
                         self.stat["sz"].configure(text=fb(tot) if tot else fb(dl))
@@ -2266,40 +3204,48 @@ def build_app():
             self.set_stage(3, "Finalizando")
             for i in range(4):
                 r = self.rows[i]
-                r["bar"].stop()
-                r["bar"].grid_forget()
-                r["ic"].configure(fg_color=YEL)
-                r["il"].configure(text="✓", text_color=BLACK)
+                self._hide_row_bar(r)
+                r["ic"].configure(fg_color=YEL, border_width=0)
+                r["il"].configure(text="✓", text_color=BLACK, font=(HEAVY, 14))
                 r["tx"].configure(text_color=WHITE)
+                r["pc"].configure(text="")
+            self._set_rbar(1.0)
+            self._set_status("●  COMPLETADO", GREEN)
             self.b_open.configure(state="normal")
             self.show_buttons("done")
             self.btn.configure(state="normal", text="⬇  DESCARGAR")
             
             hist = self.cfg.get("history", [])
             site = site_name(self.url.get())
-            hist.insert(0, {"title": title, "site": site, "when": time.strftime("%d/%m/%Y %H:%M"), "mode": self.cur_mode, "folder": folder})
+            item = {"title": title, "site": site, "when": time.strftime("%d/%m/%Y %H:%M"),
+                    "mode": self.cur_mode, "folder": folder}
+            hist.insert(0, item)
             self.cfg["history"] = hist[:50]
             save_cfg(self.cfg)
-            self.render_hist()
+            # Se agrega sólo la tarjeta nueva: no se reconstruye toda la lista.
+            self.prepend_hist(item)
             
             self.p_title.configure(text="¡Completado!")
             self.p_sub.configure(text=title)
             self.p_msg.configure(text="", text_color=RED)
             
             if self.cfg.get("close_when_done"):
-                time.sleep(2)
-                self.destroy()
+                self.after(1800, self._on_close)
 
         def finish_error(self, err):
             self.busy = False
             self.show_buttons("done")
             self.btn.configure(state="normal", text="⬇  DESCARGAR")
-            self.p_msg.configure(text=err, text_color=RED)
+            cancelled = "cancelado" in str(err).lower()
+            self.p_msg.configure(text="" if cancelled else err, text_color=RED)
             if 0 <= self.stage < len(self.rows):
-                self.rows[self.stage]["ic"].configure(fg_color=RED)
-                self.rows[self.stage]["il"].configure(text="✕", text_color=WHITE)
-                self.rows[self.stage]["bar"].stop()
-            self.p_title.configure(text="Error")
+                self.rows[self.stage]["ic"].configure(fg_color="#DDD" if cancelled else RED, border_width=0)
+                self.rows[self.stage]["il"].configure(text="■" if cancelled else "✕",
+                                                      text_color=BLACK if cancelled else WHITE)
+                self._hide_row_bar(self.rows[self.stage])
+            self.p_title.configure(text="Cancelado" if cancelled else "Error")
+            self._set_status("●  CANCELADO" if cancelled else "●  ERROR", GRAY if cancelled else RED)
+            self._set_rbar(0.0)
 
     # -------- ARRANQUE DE LA APLICACIÓN --------
     uri = sys.argv[1] if len(sys.argv) > 1 else ""

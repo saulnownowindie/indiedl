@@ -1,51 +1,146 @@
 # Indie Now DL
 
-Descargador de videos, audios e imágenes para Windows, con vista previa, cola por lotes, historial, selección de fragmento e integración con DaVinci Resolve.
+Descargador de video, audio e imágenes para Windows, con barra integrada en el navegador.
+Interfaz propia (CustomTkinter) con la estética de Indie Now: fondo casi negro, tarjetas
+redondeadas y acento amarillo `#FFF333`.
 
-## Instalación con un clic
+Pensado para trabajar rápido: pegás una URL (o la mandás desde el navegador), elegís
+calidad y formato, y el archivo queda donde lo esperás. También maneja recortes por
+In/Out, lotes e imágenes de Instagram.
 
-1. Descarga este repositorio como ZIP y extrae **toda** la carpeta.
-2. Haz doble clic en `INSTALAR.bat`.
-3. La ventana de PowerShell muestra cada etapa, la salida de `pip` y cualquier error. Si Python 3.12 no está instalado, descarga Python 3.12.10 de python.org y lo instala para el usuario actual.
-4. Cuando termine, abre el acceso directo **IndieDL** que se crea en el Escritorio.
+---
 
-El instalador crea un entorno aislado en `%LOCALAPPDATA%\IndieDL\venv`, instala las dependencias, copia la aplicación a `%LOCALAPPDATA%\IndieDL`, crea el acceso directo y registra el protocolo `ytdl://` para los enlaces compatibles. No requiere permisos de administrador. La instalación inicial necesita Internet.
+## Instalación en un PC nuevo
 
-## Qué instala
+1. Instalá Git (una sola vez): `winget install --id Git.Git -e`
+2. Cloná y ejecutá el instalador:
 
-- Python 3.12 de 64 bits, si hace falta.
-- `customtkinter` y Pillow para la interfaz y las vistas previas.
-- `yt-dlp` con sus extras para los sitios compatibles.
-- `gallery-dl` para imágenes de Instagram.
-- `imageio-ffmpeg`, que proporciona FFmpeg cuando no hay una instalación del sistema.
+```powershell
+git clone https://github.com/saulnownowindie/indiedl.git
+cd indiedl
+.\INSTALAR.bat
+```
 
-El instalador no incorpora cookies del navegador, historial, configuración personal, videos descargados ni registros. La sesión de Instagram se toma del navegador que el usuario elija en la aplicación. Algunos sitios pueden cambiar sus requisitos de acceso; las cookies y el acceso válido siguen dependiendo de cada cuenta y plataforma.
+Eso es todo. `INSTALAR.bat` deja el equipo listo sin que tengas que tocar nada más:
+
+| Paso | Qué hace |
+|---|---|
+| 1 | Verifica Python 3.10–3.13. Si no hay, lo instala solo (winget o el instalador oficial de python.org). |
+| 2 | Crea el entorno virtual en `%LOCALAPPDATA%\IndieDL\venv`. |
+| 3 | Instala las dependencias de `requirements.txt` (CustomTkinter, Pillow, yt-dlp, gallery-dl, imageio-ffmpeg). |
+| 4 | Copia la app y la extensión a `%LOCALAPPDATA%\IndieDL`. |
+| 5 | Instala FFmpeg con winget. Si falla, la app usa el binario incluido en `imageio-ffmpeg` y funciona igual. |
+| 6 | Registra el protocolo `ytdl://` (lo usa la extensión) y crea accesos directos en Escritorio y Menú Inicio. |
+
+Al terminar abre la app para que veas que quedó andando.
+
+> El instalador se puede correr las veces que quieras: es idempotente. Si actualizás el
+> repo con `git pull`, volvé a ejecutar `INSTALAR.bat` y listo.
+
+### Requisitos
+
+- Windows 10 u 11 (64 bits)
+- Conexión a internet (solo para instalar y para descargar)
+- Opcional: Google Chrome, Edge, Brave o Helium para la barra del navegador
+
+---
 
 ## Uso
 
-- Pega un enlace y elige video, audio o imágenes.
-- Selecciona calidad, carpeta y, si hace falta, un rango para recortar.
-- La interfaz muestra el progreso, la velocidad, el tiempo restante y los mensajes.
-- `analizar_media.py` permite revisar un archivo de video o audio existente; se puede arrastrar el archivo encima del script o usarlo desde una terminal.
+- **Acceso directo** «Indie Now DL» en el Escritorio o en el Menú Inicio.
+- O `Iniciar IndieDL.bat` desde la carpeta del repo.
+- Pegá una URL y elegí calidad/formato. Para recortes, completá In/Out.
+- Las descargas van a la última carpeta usada (se guarda en la configuración).
 
-Cuando un archivo requiera normalización a H.264, IndieDL intenta NVIDIA NVENC primero y continúa con codificación por CPU si NVENC o la GPU no están disponibles. La conversión por CPU puede tardar más.
+### Barra en el navegador (Chrome / Edge / Brave / Helium)
 
-## DaVinci Resolve
+La barra aparece sobre YouTube, Instagram, TikTok, X/Twitter y Pinterest, y manda el
+link a la app sin copiar y pegar.
 
-La aplicación instala y ejecuta la interfaz de Windows. **No** instala DaVinci Resolve ni cambia sus ajustes. Para importar el archivo descargado, abre Resolve y usa el Media Pool. La conversión opcional de audio a PCM MOV y la normalización de archivos están pensadas para facilitar la compatibilidad, pero no pueden corregir una fuente que ya llegó sin audio.
+1. Abrí `chrome://extensions` (o `edge://extensions`).
+2. Activá **Modo de desarrollador**.
+3. **Cargar descomprimida** → elegí `%LOCALAPPDATA%\IndieDL\browser-extension`.
+4. Recargá la pestaña donde estés probando.
 
-## Privacidad y permisos
+Los navegadores no permiten que un instalador cargue una extensión en un perfil personal
+por su cuenta: ese paso es manual y es una sola vez. El instalador sí deja la carpeta
+copiada y el protocolo `ytdl://` registrado, que es lo que la extensión necesita.
 
-La configuración y el historial se guardan localmente en `%LOCALAPPDATA%\IndieDL\config.json`; el registro se guarda en `%LOCALAPPDATA%\IndieDL\indiedl.log`. Esos archivos quedan fuera del repositorio. Usa la herramienta solamente con contenido que tengas derecho a descargar.
+---
 
-## Desarrollo
+## Dónde quedan las cosas
 
-Requiere Python 3.12 de 64 bits. Para instalar en un entorno de desarrollo:
+| Qué | Dónde |
+|---|---|
+| Programa | `%LOCALAPPDATA%\IndieDL\` |
+| Entorno virtual | `%LOCALAPPDATA%\IndieDL\venv\` |
+| Configuración | `%LOCALAPPDATA%\IndieDL\config.json` |
+| Registro de errores | `%LOCALAPPDATA%\IndieDL\indiedl.log` |
+| Temporales de descarga | `%LOCALAPPDATA%\IndieDL\tmp\` |
+| Extensión | `%LOCALAPPDATA%\IndieDL\browser-extension\` |
+
+Ninguno de esos archivos vive en el repo: `config.json`, los logs, los temporales y las
+cookies están en `.gitignore`. Podés desinstalar borrando esa carpeta y los accesos
+directos.
+
+---
+
+## Actualizar
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe app\indiedl.py
+git pull
+.\INSTALAR.bat
 ```
 
-`yt-dlp` también se actualiza desde la aplicación. Las versiones iniciales de dependencias instaladas en una PC nueva están fijadas en `requirements.txt`.
+Si cambió la extensión, en `chrome://extensions` tocá **↻ Actualizar** en la tarjeta de
+IndieDL y recargá la pestaña.
+
+---
+
+## Estructura
+
+```
+indiedl/
+├─ app/
+│  ├─ indiedl.py            # aplicación (interfaz + descarga)
+│  └─ analizar_media.py     # metadatos y duración vía FFmpeg
+├─ installer/
+│  └─ instalar.ps1          # lógica del instalador
+├─ browser-extension/       # extensión de Chrome/Edge (Manifest V3)
+│  ├─ manifest.json
+│  ├─ content.js
+│  ├─ clipboard-hook.js
+│  └─ README.md
+├─ requirements.txt
+├─ INSTALAR.bat             # instalador (doble clic)
+└─ Iniciar IndieDL.bat
+```
+
+---
+
+## Problemas comunes
+
+**«Falta yt-dlp» o falla la descarga de YouTube**
+La app se autoactualiza a la nightly de yt-dlp al arrancar. Si el error sigue, corré:
+`%LOCALAPPDATA%\IndieDL\venv\Scripts\python.exe -m pip install -U --pre "yt-dlp[default,curl-cffi]"`
+
+**Instagram pide login**
+La app lee las cookies del navegador que elijas en Ajustes. Iniciá sesión en ese navegador,
+cerralo (o dejalo abierto si es Firefox/Zen) y reintentá.
+
+**La barra no aparece**
+Verificá que la extensión esté cargada y habilitada, y que la página sea uno de los sitios
+soportados. Si usabas el userscript de Violentmonkey, desactivalo para que no se dupliquen.
+
+**FFmpeg no aparece**
+`winget install --id Gyan.FFmpeg -e`  ·  o reinstalá con `INSTALAR.bat` (la app tiene
+fallback propio y funciona sin FFmpeg en el PATH).
+
+---
+
+## Notas
+
+- Probado en Windows 11 con Python 3.12 y `customtkinter` 6.0.
+- La interfaz arma la ventana completa antes de mostrarla, así no se ve el armado.
+- El scroll de los paneles es propio (rueda suave, 120–190 ms) para que funcione sobre
+  cualquier tarjeta o etiqueta, no solo sobre el lienzo.

@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "IndieDL - Barra integrada",
+  "version": "1.0.2",
+  "description": "Barra de descarga IndieDL para páginas compatibles. Envía enlaces a la aplicación IndieDL instalada en este equipo.",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.instagram.com/*",
+        "*://*.tiktok.com/*",
+        "*://*.x.com/*",
+        "*://*.twitter.com/*",
+        "*://*.pinterest.com/*",
+        "*://*.pinterest.es/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["*://*.tiktok.com/*"],
+      "js": ["clipboard-hook.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    }
+  ]
+}
