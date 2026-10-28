@@ -70,6 +70,19 @@ function Probar-Escritura {
     return $false
 }
 
+# pythonw.exe del Python base (el que creo el venv). Si no existe, usa el del venv.
+function Get-HostPyW {
+    try {
+        $base = (& $VenvPy -c "import sys;print(sys.base_prefix)" 2>$null | Select-Object -First 1)
+        if ($base) {
+            $cand = Join-Path "$base".Trim() 'pythonw.exe'
+            if (Test-Path $cand) { return $cand }
+        }
+    } catch { }
+    if (Test-Path $VenvPyW) { return $VenvPyW }
+    return $VenvPy
+}
+
 function Refrescar-Ruta {
     $maquina = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $usuario = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -229,6 +242,7 @@ if (Probar-Escritura) {
 Paso '5/6  Archivos de la aplicacion'
 Copy-Item (Join-Path $RepoDir 'app\indiedl.py') $AppDir -Force
 Copy-Item (Join-Path $RepoDir 'app\analizar_media.py') $AppDir -Force
+Copy-Item (Join-Path $RepoDir 'app\launcher.pyw') $AppDir -Force
 $extDst = Join-Path $AppDir 'browser-extension'
 New-Item -ItemType Directory -Force -Path $extDst | Out-Null
 Copy-Item (Join-Path $RepoDir 'browser-extension\*') $extDst -Force
@@ -254,9 +268,10 @@ try {
 }
 
 if (-not $SinAccesoDirecto) {
-    $pythonw = $VenvPyW
-    if (-not (Test-Path $pythonw)) { $pythonw = $VenvPy }
-    $appPy = Join-Path $AppDir 'indiedl.py'
+    # Los accesos usan el pythonw del Python BASE + launcher.pyw (no el del venv),
+    # para no heredar una etiqueta de integridad baja.
+    $pythonw = Get-HostPyW
+    $appPy = Join-Path $AppDir 'launcher.pyw'
     $escritorio = [Environment]::GetFolderPath('Desktop')
     $inicio = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
     Nuevo-Acceso -Ruta (Join-Path $escritorio 'Indie Now DL.lnk') -Destino $pythonw `
@@ -282,7 +297,7 @@ Write-Host '  =========================================================' -Foregr
 if (-not $SinAbrir) {
     Write-Host ''
     Write-Host '   Abriendo Indie Now DL...' -ForegroundColor DarkGray
-    Start-Process -FilePath $VenvPyW -ArgumentList @((Join-Path $AppDir 'indiedl.py')) -WorkingDirectory $AppDir
+    Start-Process -FilePath (Get-HostPyW) -ArgumentList @((Join-Path $AppDir 'launcher.pyw')) -WorkingDirectory $AppDir
 }
 
 exit 0
