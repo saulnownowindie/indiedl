@@ -150,12 +150,21 @@ def register():
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
     pyw = pyw if pyw.exists() else exe
-    cmd = f'"{pyw}" "{Path(__file__).resolve()}" "%1"'
-    base = r"Software\Classes\ytdl"
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as k:
+    here = Path(__file__).resolve()
+    launcher = here.with_name("launcher.pyw")
+    if launcher.exists():
+        # El lanzador corre con el pythonw del Python BASE (no el del venv): asi
+        # no hereda una etiqueta de integridad baja y puede corregirla.
+        base = Path(sys.base_prefix) / "pythonw.exe"
+        host = base if base.exists() else pyw
+        cmd = f'"{host}" "{launcher}" "%1"'
+    else:
+        cmd = f'"{pyw}" "{here}" "%1"'
+    base_key = r"Software\Classes\ytdl"
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base_key) as k:
         winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "URL:ytdl Protocol")
         winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\shell\open\command") as k:
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base_key + r"\shell\open\command") as k:
         winreg.SetValueEx(k, "", 0, winreg.REG_SZ, cmd)
 
 def parse_timestamp(value):
@@ -193,8 +202,6 @@ def enforce_clip(ff, path, section, mode, quality, q):
     start, end = section
     wanted = max(0.0, float(end) - float(start))
     duration = media_duration(ff, path)
-    # A completed section should never be longer than the requested range.
-    # If yt-dlp returns the whole source, do the cut ourselves before success.
     if duration is not None and duration <= wanted + 1.25:
         q.put(("log", f"Duración del recorte verificada: {format_seconds(duration)} s"))
         return path
@@ -242,7 +249,6 @@ def enforce_clip(ff, path, section, mode, quality, q):
         else:
             raise RuntimeError("No se pudo verificar ni aplicar el recorte In/Out. " + last_error[-300:])
     else:
-        # Audio outputs are selected by the existing audio format menu.
         target = path
         temporary = source_base + ".indiedl_clip.tmp" + source_ext
         codec_args = {
@@ -269,10 +275,15 @@ def enforce_clip(ff, path, section, mode, quality, q):
                 pass
             raise RuntimeError("FFmpeg no pudo verificar la duración del recorte de audio.")
 
-    try:
-        os.replace(temporary, target)
-    except OSError as exc:
-        raise RuntimeError(f"No se pudo guardar el recorte final: {exc}") from exc
+    for intento in range(15):
+        try:
+            os.replace(temporary, target)
+            break
+        except (PermissionError, OSError) as exc:
+            if intento == 14:
+                raise RuntimeError(f"No se pudo guardar el recorte final. Bloqueo: {exc}") from exc
+            time.sleep(0.5)
+
     if os.path.abspath(path) != os.path.abspath(target):
         try:
             os.remove(path)
@@ -306,12 +317,9 @@ def maybe_update_ytdlp(cfg, q, force=False):
         return False
 
 def ffmpeg_path():
-    # 1) FFmpeg disponible en PATH.
     p = shutil.which("ffmpeg")
     if p:
         return p
-
-    # 2) Copias locales que puede incluir el instalador de IndieDL.
     candidates = [
         APP_DIR / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
         APP_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
@@ -320,8 +328,6 @@ def ffmpeg_path():
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-
-    # 3) Binario distribuido por imageio-ffmpeg dentro del entorno virtual.
     try:
         import imageio_ffmpeg
         binary = imageio_ffmpeg.get_ffmpeg_exe()
@@ -410,12 +416,12 @@ def ensure_mp4_aac(ff, src, q):
         return src
     
     def safe_replace(src_path, dst_path):
-        for _ in range(5):
+        for _ in range(15):
             try:
                 os.replace(src_path, dst_path)
                 return True
             except PermissionError:
-                time.sleep(1)
+                time.sleep(0.5)
         return False
 
     if r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
@@ -510,8 +516,6 @@ def video_needs_h264(info):
     pm = re.search(r"\b(yuvj?4\d\dp\w*|gbrp\w*|nv\d+|p0\d+\w*|rgb\w*|bgr\w*)\b", line)
     if pm and pm.group(1) not in ("yuv420p", "yuvj420p"):
         return f"formato de píxel {pm.group(1)}"
-    # Variable frame rate is valid media. Do not re-encode it just because
-    # ffprobe's nominal fps and tbr differ; that can introduce A/V drift.
     return None
 
 def ensure_h264(ff, src, q):
@@ -554,12 +558,12 @@ def ensure_h264(ff, src, q):
                 continue
 
             def safe_replace(src_path, dst_path):
-                for _ in range(5):
+                for _ in range(15):
                     try:
                         os.replace(src_path, dst_path)
                         return True
                     except PermissionError:
-                        time.sleep(1)
+                        time.sleep(0.5)
                 return False
 
             if safe_replace(dst, final):
@@ -626,12 +630,12 @@ def to_pcm_mov(ff, src, q):
         return src
     if r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
         def safe_replace(src_path, dst_path):
-            for _ in range(5):
+            for _ in range(15):
                 try:
                     os.replace(src_path, dst_path)
                     return True
                 except PermissionError:
-                    time.sleep(1)
+                    time.sleep(0.5)
             return False
         if safe_replace(dst, final):
             if os.path.abspath(final) != os.path.abspath(src):
@@ -724,7 +728,6 @@ def cookie_source(cfg):
             return "firefox", found["profile"]
         found = next((c for c in candidates if c["browser"] == "helium"), None)
         if found:
-            # Helium usa Chromium y mantiene sus claves/cookies bajo su propio User Data.
             return "chromium", found["profile"]
         for browser in ("chrome", "edge", "brave"):
             if any(c["browser"] == browser for c in candidates):
@@ -750,14 +753,12 @@ COOKIES_FILE = APP_DIR / "instagram_cookies.txt"
 YT_COOKIES = APP_DIR / "youtube_cookies.txt"
 
 def yt_cookie_opts(url):
-    """cookies.txt de YouTube (sesion iniciada) solo para links de YouTube."""
     u = str(url).lower()
     if ("youtube.com" in u or "youtu.be" in u) and YT_COOKIES.is_file() and YT_COOKIES.stat().st_size > 0:
         return {"cookiefile": str(YT_COOKIES)}
     return {}
 
 def cookies_file_path(cfg=None):
-    """cookies.txt exportado: funciona con el navegador abierto y evita el bloqueo/cifrado de Chromium."""
     try:
         if COOKIES_FILE.is_file() and COOKIES_FILE.stat().st_size > 0:
             return str(COOKIES_FILE)
@@ -776,12 +777,50 @@ BROWSER_PROC_HINT = {"helium": "helium", "chrome": "chrome", "edge": "msedge", "
 BROWSER_PRETTY = {"helium": "Helium", "chrome": "Chrome", "edge": "Edge", "brave": "Brave",
                   "zen": "Zen", "firefox": "Firefox"}
 
+def _low_integrity():
+    """True si este proceso corre con integridad BAJA (no puede escribir fuera de IndieDL).
+
+    Lee el nivel del token (RID < 0x2000), asi que no depende del idioma de Windows.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        adv.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+        tok = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):
+            return False
+        try:
+            need = wintypes.DWORD(0)
+            adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(need))  # TokenIntegrityLevel
+            buf = ctypes.create_string_buffer(need.value)
+            if not adv.GetTokenInformation(tok, 25, buf, need, ctypes.byref(need)):
+                return False
+            sid = ctypes.c_void_p.from_buffer(buf).value
+            count = adv.GetSidSubAuthorityCount(sid).contents.value
+            rid = adv.GetSidSubAuthority(sid, count - 1).contents.value
+            return rid < 0x2000
+        finally:
+            k32.CloseHandle(tok)
+    except Exception:
+        return False
+
 def _is_lock_error(exc):
     low = str(exc).lower()
     return "permission" in low or "errno 13" in low or "could not copy" in low or "being used" in low
 
 def running_browser_processes(key):
-    """Nombres de procesos (.exe) del navegador que están abiertos ahora."""
     if os.name != "nt":
         return []
     hint = BROWSER_PROC_HINT.get(key, key)
@@ -806,7 +845,6 @@ def close_browser_processes(names):
             pass
 
 def _instagram_cookie_rows(jar):
-    """Solo cookies de instagram.com en formato Netscape. Devuelve (filas, tiene_sessionid)."""
     import time as _t
     far = int(_t.time()) + 365 * 24 * 3600
     rows, has = ["# Netscape HTTP Cookie File"], False
@@ -822,9 +860,6 @@ def _instagram_cookie_rows(jar):
     return rows, has
 
 def import_instagram_cookies_auto(cfg=None):
-    """Busca la sesión de Instagram en los navegadores instalados y guarda SOLO las cookies de
-    instagram.com en un archivo local. Devuelve (ok, estado, detalle):
-    estado = ok | locked (navegador abierto, detalle=clave) | nosession | error."""
     try:
         from yt_dlp.cookies import extract_cookies_from_browser
     except Exception as exc:
@@ -900,9 +935,6 @@ def add_cookie_lock_hint(detail):
     return detail
 
 def _parse_gdl_dump(stdout):
-    """Lee la salida de `gallery-dl --dump-json`.
-    Formato real: un JSON (con sangría, en varias líneas) = [[2, {dir}], [3, "url", {meta}], ...].
-    También acepta un JSON por línea o varios JSON seguidos."""
     values = []
     text = stdout.strip()
     if text:
@@ -1043,12 +1075,6 @@ def ensure_temp_dir():
     return temp_path
 
 def ytdlp_exe():
-    """yt-dlp suelto, sólo si el módulo de Python no está disponible.
-
-    El camino normal es el módulo `yt_dlp` que instala INSTALAR.bat: es el que
-    la app mantiene actualizado con pip. Un .exe de winget puede quedar viejo
-    y romper las descargas, así que sólo se usa como último recurso.
-    """
     try:
         import yt_dlp  # noqa: F401
         return None
@@ -1193,7 +1219,6 @@ def exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section=None):
 
 def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image_indices=None, cached_info=None):
     try:
-        # Evitar que una URL de inicio de TikTok/Instagram llegue a yt-dlp como si fuera un vídeo.
         from urllib.parse import urlparse
         parsed_url = urlparse(str(url or "").strip())
         host = (parsed_url.hostname or "").lower()
@@ -1226,9 +1251,6 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 "o reinstalá IndieDL. Sin ffmpeg no se puede unir audio y video."
             )
 
-        # yt-dlp publica versiones casi a diario y YouTube rompe seguido: se
-        # actualiza una vez por día, en este mismo hilo (nunca en paralelo con
-        # otra descarga) y sin bloquear la ventana.
         try:
             maybe_update_ytdlp(cfg, q)
         except Exception:
@@ -1236,13 +1258,10 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
 
         exe = ytdlp_exe() if mode in ("video", "audio") else None
         if exe:
-            final, _title = exe_download(exe, url, mode, folder, cfg, q, quality, cancel, section)
+            final, _title = exe_download(exe, url, mode, TEMP_DIR, cfg, q, quality, cancel, section)
             st = {"files": [], "meta": True, "title": _title}
             res = {"title": _title}
         else:
-            # Sin .exe suelto: se usa el módulo de yt-dlp del entorno. Es el
-            # camino normal (INSTALAR.bat lo instala con pip), así que no hay
-            # ningún aviso que mostrar acá.
             try:
                 import yt_dlp
             except Exception as exc:
@@ -1300,12 +1319,13 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
             job_suffix = (f" [clip {fmt_hms(section[0]).replace(':', '-')}-"
                           f"{fmt_hms(section[1]).replace(':', '-')}-{uuid.uuid4().hex[:6]}]"
                           if section else "")
+            
             opts = {
-                "outtmpl": os.path.join(folder, image_prefix + f"%(title).80s [%(id)s]{job_suffix}.%(ext)s"),
+                "outtmpl": image_prefix + f"%(title).80s [%(id)s]{job_suffix}.%(ext)s",
                 "noplaylist": mode != "image", "quiet": True, "no_warnings": True, "noprogress": True,
                 "windowsfilenames": True, "progress_hooks": [hook], "postprocessor_hooks": [phook],
                 "concurrent_fragment_downloads": 4,
-                "paths": {"home": folder, "temp": str(TEMP_DIR)},
+                "paths": {"home": str(TEMP_DIR), "temp": str(TEMP_DIR)}, 
             }
             if ff:
                 opts["ffmpeg_location"] = ff
@@ -1379,11 +1399,63 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 "en la carpeta de destino. Revisá el registro."
             )
 
+        # === MOVER EL ARCHIVO A LA CARPETA DE DESTINO ===
+        q.put(("log", "Moviendo archivo a la carpeta de destino..."))
+        target_dir = Path(folder)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        final_path = Path(final)
+        target_path = target_dir / final_path.name
+        
+        if target_path.exists():
+            n = 1
+            while True:
+                target_path = target_dir / f"{final_path.stem} ({n}){final_path.suffix}"
+                if not target_path.exists():
+                    break
+                n += 1
+                
+        folder_guardado = folder
+        move_exitoso = False
+        try:
+            # Intentar COPIAR en lugar de MOVER suele evadir bloqueos de antivirus
+            for intento in range(10):
+                try:
+                    shutil.copy2(str(final_path), str(target_path))
+                    move_exitoso = True
+                    break
+                except (PermissionError, OSError) as e:
+                    if intento == 9:
+                        raise e
+                    time.sleep(0.5)
+            
+            if move_exitoso:
+                final = str(target_path)
+                try: os.remove(final_path)
+                except Exception: pass
+                q.put(("log", "Guardado exitoso en: " + final))
+        except Exception as move_err:
+            q.put(("log", f"Error al mover a la carpeta de destino: {move_err}"))
+            if _low_integrity():
+                msg = (f"No se pudo guardar en {folder}: IndieDL corre con integridad baja "
+                       f"(etiqueta heredada de la carpeta IndieDL).\n"
+                       f"Solución: ejecuta INSTALAR.bat otra vez, o en PowerShell:\n"
+                       f'icacls "%LOCALAPPDATA%\\IndieDL" /setintegritylevel "(OI)(CI)M" /T\n'
+                       f"El archivo se guardó en la carpeta temporal: {TEMP_DIR}")
+            else:
+                msg = (f"No se pudo guardar en {folder} por un bloqueo de Windows.\n"
+                       f"(Puede ser la 'Protección contra ransomware' de Windows Defender, "
+                       f"otro antivirus, o que el archivo esté abierto en otro programa. "
+                       f"El archivo se guardó en la carpeta temporal: {TEMP_DIR})")
+            q.put(("note", msg))
+            q.put(("warn", msg))
+            folder_guardado = str(TEMP_DIR)
+            final = str(final_path)
+
         if mode == "video" and ff and "Audio:" not in probe(ff, final):
             q.put(("log", "ATENCION: el archivo final NO trae pista de audio"))
         q.put(("stage", 3, "Finalizando"))
         q.put(("log", "Archivo final verificado: " + os.path.basename(final)))
-        q.put(("done", os.path.dirname(final), st["title"] or (res or {}).get("title") or url))
+        q.put(("done", folder_guardado, st["title"] or (res or {}).get("title") or url))
     except Exception as e:
         err_text = str(e).replace("ERROR: ", "").strip()
         log(f"download {url}: {e!r}\n{traceback.format_exc()}")
@@ -1447,12 +1519,6 @@ def halftone_header(w, h):
     return img
 
 def cached_header(w=1040, h=120):
-    """Devuelve la cabecera ya renderizada.
-
-    La primera vez se dibuja y se guarda en disco; las siguientes aperturas la
-    cargan en unos pocos milisegundos. Así la ventana puede mostrarse completa
-    desde el primer fotograma, sin que se vea cómo se arma la interfaz.
-    """
     try:
         from PIL import Image
     except Exception:
@@ -1489,16 +1555,6 @@ def build_app():
     SPIN = "◐◓◑◒"
 
     class SmoothScroll(ctk.CTkFrame):
-        """Área de scroll propia con rueda suave y siempre activa.
-
-        CustomTkinter sólo mueve su CTkScrollableFrame cuando el puntero cae
-        exactamente sobre el lienzo o sobre un hijo que reconoce; con tarjetas
-        y etiquetas anidadas eso falla a veces y obliga a arrastrar la barra.
-        Acá un único manejador global busca el área que está debajo del puntero
-        y anima el desplazamiento con una curva corta (la misma idea que usa
-        AutoSubs para sus paneles: 150-200 ms, una sola curva, sin rebotes).
-        """
-
         def __init__(self, master, fg_color=BLACK, registry=None,
                      scrollbar_button_color="#2B333C", **kwargs):
             super().__init__(master, fg_color=fg_color, corner_radius=0, **kwargs)
@@ -1517,7 +1573,6 @@ def build_app():
             self.grid_rowconfigure(0, weight=1)
             self.grid_columnconfigure(0, weight=1)
 
-            # Ojo: CTkFrame ya usa self._canvas para su fondo redondeado.
             self._view = tk.Canvas(self, bg=fg_color, highlightthickness=0,
                                    bd=0, relief="flat", takefocus=0)
             self._view.grid(row=0, column=0, sticky="nsew")
@@ -1535,7 +1590,6 @@ def build_app():
             self._view.bind("<Configure>", self._on_view_configure, add="+")
             self.bind("<Destroy>", self._on_destroy, add="+")
 
-        # ---- geometría ----
         def _on_body_configure(self, _event=None):
             self._content_h = max(1, self.body.winfo_reqheight())
             self._view.configure(scrollregion=(0, 0, max(1, self.body.winfo_width()), self._content_h))
@@ -1555,7 +1609,6 @@ def build_app():
             except Exception:
                 pass
 
-        # ---- estado / animación ----
         def _on_yview(self, first, last):
             try:
                 self._scrollbar.set(first, last)
@@ -1563,10 +1616,7 @@ def build_app():
                 pass
             self._visible_frac = max(0.0, float(last) - float(first))
             if self._animating or self._anim_job is not None:
-                # El movimiento lo está produciendo nuestra animación: no hay
-                # que reescribir el destino con la posición intermedia.
                 return
-            # Movimiento externo (arrastre de la barra, resize, etc.).
             self._anim_target = float(first)
             self._anim_start = float(first)
 
@@ -1600,14 +1650,12 @@ def build_app():
                 return
             now = time.perf_counter()
             current = float(self._view.yview()[0])
-            # Si la animación anterior ya terminó, se parte desde donde está.
             if self._anim_job is None or now > self._anim_t0 + self._anim_dur + 0.05:
                 self._anim_target = current
             frac = float(px) / max(1.0, float(self._content_h))
             self._anim_target = max(0.0, min(1.0, self._anim_target + frac))
             self._anim_start = current
             self._anim_t0 = now
-            # Un solo gesto corto: mismo feel que los 180 ms de AutoSubs.
             self._anim_dur = 0.12 if abs(px) < 40 else 0.19
             if self._anim_job is None:
                 self._anim_job = self.after(8, self._anim_tick)
@@ -1638,7 +1686,7 @@ def build_app():
             try:
                 elapsed = time.perf_counter() - self._anim_t0
                 p = 1.0 if self._anim_dur <= 0 else min(1.0, elapsed / self._anim_dur)
-                eased = 1.0 - (1.0 - p) ** 3   # cubic ease-out
+                eased = 1.0 - (1.0 - p) ** 3
                 pos = self._anim_start + (self._anim_target - self._anim_start) * eased
                 self._animating = True
                 try:
@@ -1648,8 +1696,6 @@ def build_app():
                 if p < 1.0:
                     self._anim_job = self.after(8, self._anim_tick)
                 else:
-                    # Si el lienzo recortó el destino (fin del contenido), se
-                    # sincroniza para que el próximo gesto arranque bien.
                     real = float(self._view.yview()[0])
                     self._anim_target = real
                     self._anim_start = real
@@ -1672,9 +1718,6 @@ def build_app():
             self._boot_t0 = time.perf_counter()
             super().__init__()
             self._mark("super")
-            # La ventana se construye completa fuera de pantalla. Recién cuando
-            # todos los widgets están listos se muestra con un fade corto: no
-            # hay primer fotograma vacío ni textos de "cargando".
             self.withdraw()
             self._alpha_ok = True
             try:
@@ -1707,12 +1750,11 @@ def build_app():
             self._bar_target = {}
             self._bar_jobs = {}
             self._gallery_dl_ok = bool(self.cfg.get("gallery_dl_ok", True))
+            self._last_warn = ""
             self.stage = -1
             self.spin_i = 0
             self.t0 = time.time()
             self.title("Indie Now DL")
-            # Ventana normal, centrada y dimensionada según la pantalla. Evita
-            # el salto visual de abrir primero en pequeño y maximizar después.
             screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
             width = min(1480, max(760, screen_w - 48))
             height = min(860, max(560, screen_h - 96))
@@ -1798,8 +1840,6 @@ def build_app():
             if clip:
                 self.after(500, lambda c=clip: self.apply_clip(c))
             self.bind("<Return>", lambda e: self.start() if self.form.winfo_ismapped() else None)
-            # Un único manejador global: la rueda funciona sobre cualquier hijo,
-            # sin depender de que CustomTkinter acierte el widget de destino.
             self.bind_all("<MouseWheel>", self._on_wheel_all, add="+")
             if sys.platform.startswith("linux"):
                 self.bind_all("<Button-4>", self._on_wheel_all, add="+")
@@ -1816,7 +1856,7 @@ def build_app():
 
         def _check_gallery_dl(self):
             try:
-                proc = subprocess.run(                    gallery_dl_command() + ["--version"],
+                proc = subprocess.run(gallery_dl_command() + ["--version"],
                     capture_output=True, timeout=10,
                     creationflags=NO_WINDOW, check=False,
                 )
@@ -1828,9 +1868,7 @@ def build_app():
                 log(f"gallery-dl no disponible: {exc!r}")
                 return False
 
-        # ---- arranque visual ----
         def _reveal(self):
-            """Muestra la ventana ya armada, con un fade de ~150 ms."""
             try:
                 self.update_idletasks()
             except Exception:
@@ -1850,9 +1888,6 @@ def build_app():
                 self._finish_reveal()
 
         def _fade_in(self, step):
-            # Pocos pasos a propósito: en Windows cada cambio de alfa repinta la
-            # ventana completa (~40 ms con el historial cargado). Tres avances
-            # se sienten igual de suaves y evitan medio segundo de espera.
             steps = 4
             p = min(1.0, float(step) / steps)
             alpha = 1.0 - (1.0 - p) ** 3
@@ -1877,8 +1912,6 @@ def build_app():
                 self.focus_force()
             except Exception:
                 pass
-            # La ventana ya está visible y completa. El resto del historial se
-            # agrega en tandas de 16 ms, por debajo del área visible.
             self.after(1, self._grow_hist)
             log(f"UI lista en {int((time.perf_counter() - self._boot_t0) * 1000)} ms")
 
@@ -1889,7 +1922,7 @@ def build_app():
                 import ctypes
                 hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
                 value = ctypes.c_int(1)
-                for attr in (20, 19):  # Win10/11: immersive dark mode
+                for attr in (20, 19):
                     if ctypes.windll.dwmapi.DwmSetWindowAttribute(
                             hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
                         break
@@ -1914,7 +1947,6 @@ def build_app():
             except Exception:
                 pass
 
-        # ---- rueda global ----
         def _wheel_target(self, x_root, y_root):
             for area in reversed(self._scroll_areas):
                 try:
@@ -1933,7 +1965,6 @@ def build_app():
                 target = self._wheel_target(event.x_root, event.y_root)
                 if target is None:
                     return None
-                # Un Text/Listbox propio conserva su scroll nativo.
                 try:
                     widget = self.winfo_containing(event.x_root, event.y_root)
                     if widget is not None and widget.winfo_class() in ("Text", "Listbox", "TCombobox"):
@@ -1952,7 +1983,6 @@ def build_app():
             except Exception:
                 return None
 
-        # ---- gallery-dl sin bloquear el arranque ----
         def _schedule_gallery_check(self):
             checked = float(self.cfg.get("gallery_dl_checked") or 0)
             has_cache = "gallery_dl_ok" in self.cfg
@@ -1990,7 +2020,6 @@ def build_app():
             if notify and changed:
                 log("gallery-dl disponible" if ok else "gallery-dl no disponible")
 
-        # ---- pequeños estados visuales ----
         def _set_status(self, text, color):
             try:
                 self.status_pill.configure(text=text, text_color=color)
@@ -2049,8 +2078,6 @@ def build_app():
                 pass
 
         def build_form(self, url):
-            # La columna izquierda agrupa enlace y vista previa. La derecha
-            # contiene las opciones y el botón principal.
             left_stack = ctk.CTkFrame(self.form, fg_color="transparent")
             left_stack.grid(row=0, column=0, sticky="new", padx=(0, 8))
             right_stack = ctk.CTkFrame(self.form, fg_color="transparent")
@@ -2213,8 +2240,6 @@ def build_app():
                 tx.grid(row=0, column=1, sticky="w", pady=(4, 0))
                 pc = ctk.CTkLabel(r, text="", font=(HEAVY, 13), text_color=WHITE)
                 pc.grid(row=0, column=2, sticky="e")
-                # La pista queda siempre en el layout: al aparecer la barra de
-                # un paso, los demás no saltan de posición.
                 track = ctk.CTkFrame(r, fg_color="transparent", height=10)
                 track.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(4, 0))
                 track.grid_propagate(False)
@@ -2252,13 +2277,12 @@ def build_app():
                                           font=(HEAVY, 15), command=lambda: self.cancel.set())
             self.b_open = ctk.CTkButton(bt, text="ABRIR CARPETA", height=48, corner_radius=4, fg_color="#20272E",
                                         hover_color="#303942", text_color=WHITE, border_width=3, border_color=BLACK,
-                                        font=(HEAVY, 15), command=lambda: self.open_dir(self.cfg["last_dir"]))
+                                        font=(HEAVY, 15), command=lambda: self.open_dir(self.cfg.get("last_saved", self.cfg["last_dir"])))
             self.b_back = ctk.CTkButton(bt, text="DESCARGAR OTRO", height=48, corner_radius=4, fg_color=YEL,
                                         hover_color=YEL_H, text_color=BLACK, border_width=3, border_color=BLACK,
                                         font=(HEAVY, 15), command=self.back)
 
         def show_buttons(self, mode):
-            """Coloca los botones inferiores lado a lado, con el mismo ancho."""
             for b in (self.b_cancel, self.b_open, self.b_back):
                 b.grid_remove()
             order = (self.b_cancel, self.b_open) if mode == "run" else (self.b_open, self.b_back)
@@ -2300,9 +2324,6 @@ def build_app():
                     r["il"].configure(text=SPIN[0], text_color=YEL, font=(HEAVY, 15))
                     r["tx"].configure(text=text or r["name"], text_color=WHITE, font=(HEAVY, 15))
                     r["pc"].configure(text="")
-                    # El paso 2 tiene porcentaje real; el resto usa una barra
-                    # indeterminada. Ambas viven dentro de una pista de altura
-                    # fija, así que los demás pasos no se mueven.
                     self._show_row_bar(r, "determinate" if i == 1 else "indeterminate", reset=True)
                 else:
                     self._hide_row_bar(r)
@@ -2384,8 +2405,6 @@ def build_app():
                     self.platform_icon.configure(image=self.make_platform_logo(site), text="")
             valid = bool(url and clean_url(url))
             if hasattr(self, "platform_icon"):
-                # Nunca se escribe "Cargando…": el panel ya está completo y los
-                # datos reales entran en segundo plano sin tapar el contenido.
                 if not url:
                     self.preview_title.configure(text="Esperando un enlace")
                     self.preview_meta.configure(text="Pegá un enlace para detectar plataforma y detalles")
@@ -2472,8 +2491,6 @@ def build_app():
                     if description:
                         meta += "\n" + description
                     thumb_data = None
-                    # TikTok puede devolver la portada en `thumbnail`, en `thumbnails`
-                    # o como `cover_image_url`; no todos los extractores rellenan el mismo campo.
                     thumb_candidates = []
                     for candidate in (
                         info.get("thumbnail"),
@@ -2485,14 +2502,11 @@ def build_app():
                             thumb_candidates.append(candidate)
                     thumb_list = info.get("thumbnails") or []
                     if isinstance(thumb_list, list):
-                        # Prefer the best available thumbnail first; yt-dlp normally orders
-                        # these by preference, so reverse iteration tries the latest/best variant.
                         for item in reversed(thumb_list):
                             if isinstance(item, dict):
                                 candidate = item.get("url")
                                 if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
                                     thumb_candidates.append(candidate)
-                    # Keep order but avoid retrying identical CDN URLs.
                     thumb_candidates = list(dict.fromkeys(thumb_candidates))
                     if thumb_candidates:
                         try:
@@ -2616,7 +2630,6 @@ def build_app():
                     if raw.lower().startswith("sessionid="):
                         raw = raw.split("=", 1)[1].strip()
                     if re.fullmatch(r"[A-Za-z0-9%._:\-]{20,}", raw):
-                        # El archivo trae solo el valor de sessionid: armo el cookies.txt completo.
                         import time as _t
                         exp = int(_t.time()) + 365 * 24 * 3600
                         uid = raw.replace("%3A", ":").split(":")[0]
@@ -2780,8 +2793,6 @@ def build_app():
             win.transient(self)
             win.grab_set()
             win.configure(fg_color=BLACK)
-            # Centrada sobre la ventana principal, sin el salto de aparecer
-            # primero en una esquina.
             try:
                 x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
                 y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 2)
@@ -2966,13 +2977,6 @@ def build_app():
             return f
 
         def render_hist(self):
-            """Dibuja las primeras tarjetas del historial y deja el resto en cola.
-
-            Crear 50 tarjetas antes de mostrar la ventana costaba ~300 ms y
-            obligaba a pintar cientos de widgets en el primer fotograma. Con
-            las primeras 10 la ventana abre al instante; el resto se agrega en
-            silencio justo después del fade, sin indicadores ni saltos.
-            """
             for w in self.hist.body.winfo_children():
                 w.destroy()
             self._hist_cards = []
@@ -2994,7 +2998,6 @@ def build_app():
             self.hist.scroll_to_top()
 
         def _grow_hist(self):
-            """Agrega las tarjetas restantes en tandas cortas (sin bloquear)."""
             try:
                 if not self.winfo_exists():
                     return
@@ -3141,6 +3144,7 @@ def build_app():
                 self.stat[key].configure(text="-")
             self.p_msg.configure(text="")
             self.cancel.clear()
+            self._last_warn = ""
 
             def worker():
                 try:
@@ -3217,6 +3221,9 @@ def build_app():
                         self.add_log(ev[1])
                     elif kind == "note":
                         self.p_msg.configure(text=ev[1], text_color=YEL)
+                    elif kind == "warn":
+                        self._last_warn = ev[1]
+                        self.p_msg.configure(text=ev[1], text_color=YEL)
                     elif kind == "done":
                         _, folder, title = ev
                         self.finish(folder, title)
@@ -3237,7 +3244,6 @@ def build_app():
                 r["tx"].configure(text_color=WHITE)
                 r["pc"].configure(text="")
             self._set_rbar(1.0)
-            self._set_status("●  COMPLETADO", GREEN)
             self.b_open.configure(state="normal")
             self.show_buttons("done")
             self.btn.configure(state="normal", text="⬇  DESCARGAR")
@@ -3248,13 +3254,19 @@ def build_app():
                     "mode": self.cur_mode, "folder": folder}
             hist.insert(0, item)
             self.cfg["history"] = hist[:50]
+            self.cfg["last_saved"] = folder
             save_cfg(self.cfg)
-            # Se agrega sólo la tarjeta nueva: no se reconstruye toda la lista.
             self.prepend_hist(item)
             
-            self.p_title.configure(text="¡Completado!")
-            self.p_sub.configure(text=title)
-            self.p_msg.configure(text="", text_color=RED)
+            if getattr(self, "_last_warn", ""):
+                self.p_title.configure(text="Descargado con avisos")
+                self.p_msg.configure(text=self._last_warn, text_color=YEL)
+                self._set_status("●  AVISO", YEL)
+                self._last_warn = ""
+            else:
+                self.p_title.configure(text="¡Completado!")
+                self.p_msg.configure(text="", text_color=RED)
+                self._set_status("●  COMPLETADO", GREEN)
             
             if self.cfg.get("close_when_done"):
                 self.after(1800, self._on_close)
@@ -3274,7 +3286,6 @@ def build_app():
             self._set_status("●  CANCELADO" if cancelled else "●  ERROR", GRAY if cancelled else RED)
             self._set_rbar(0.0)
 
-    # -------- ARRANQUE DE LA APLICACIÓN --------
     uri = sys.argv[1] if len(sys.argv) > 1 else ""
     cfg = load_cfg()
     
@@ -3295,8 +3306,6 @@ def build_app():
     app.mainloop()
 
 if __name__ == "__main__":
-    # El instalador registra el protocolo con --register-only. No tocar el
-    # registro en cada apertura: evita demora y errores de permisos repetidos.
     if "--register-only" in sys.argv:
         try:
             if os.name == "nt":
@@ -3306,5 +3315,4 @@ if __name__ == "__main__":
             log(f"No se pudo registrar ytdl://: {e}")
         sys.exit(0)
 
-    # Abrir una sola interfaz en una ventana dimensionada para la pantalla.
     build_app()
