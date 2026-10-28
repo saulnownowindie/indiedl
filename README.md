@@ -26,11 +26,11 @@ Eso es todo. `INSTALAR.bat` deja el equipo listo sin que tengas que tocar nada m
 | Paso | Qué hace |
 |---|---|
 | 1 | Verifica Python 3.10–3.13. Si no hay, lo instala solo (winget o el instalador oficial de python.org). |
-| 2 | Crea el entorno virtual en `%LOCALAPPDATA%\IndieDL\venv`. |
-| 3 | Instala las dependencias de `requirements.txt` (CustomTkinter, Pillow, yt-dlp, gallery-dl, imageio-ffmpeg). |
-| 4 | Copia la app y la extensión a `%LOCALAPPDATA%\IndieDL`. |
-| 5 | Instala FFmpeg con winget. Si falla, la app usa el binario incluido en `imageio-ffmpeg` y funciona igual. |
-| 6 | Registra el protocolo `ytdl://` (lo usa la extensión) y crea accesos directos en Escritorio y Menú Inicio. |
+| 2 | Crea la carpeta `%LOCALAPPDATA%\IndieDL` y normaliza su etiqueta de integridad (evita el error de permisos al guardar). |
+| 3 | Crea el entorno virtual en `%LOCALAPPDATA%\IndieDL\venv`. |
+| 4 | Instala las dependencias de `requirements.txt` (CustomTkinter, Pillow, yt-dlp, gallery-dl, imageio-ffmpeg) y comprueba que el entorno puede guardar en carpetas normales (`D:\`, Escritorio, etc.). |
+| 5 | Copia la app, el lanzador y la extensión a `%LOCALAPPDATA%\IndieDL`. Instala FFmpeg con winget; si falla, la app usa el binario incluido en `imageio-ffmpeg` y funciona igual. |
+| 6 | Registra el protocolo `ytdl://` (lo usa la extensión) y crea accesos directos en Escritorio y Menú Inicio. Ambos apuntan a `launcher.pyw`. |
 
 Al terminar abre la app para que veas que quedó andando.
 
@@ -48,9 +48,17 @@ Al terminar abre la app para que veas que quedó andando.
 ## Uso
 
 - **Acceso directo** «Indie Now DL» en el Escritorio o en el Menú Inicio.
-- O `Iniciar IndieDL.bat` desde la carpeta del repo.
 - Pegá una URL y elegí calidad/formato. Para recortes, completá In/Out.
 - Las descargas van a la última carpeta usada (se guarda en la configuración).
+
+### El lanzador (`launcher.pyw`)
+
+Los accesos directos y el protocolo `ytdl://` no abren `indiedl.py` directamente: pasan
+por `launcher.pyw`, que corre con el `pythonw.exe` del Python base (no el del entorno
+virtual). Antes de abrir la app revisa si la carpeta de IndieDL quedó con etiqueta de
+integridad **baja** (lo que impide guardar en `D:\`, Escritorio, etc.) y, si es así, la
+corrige sola. Después abre la app pasándole la URL tal cual. Si algo falla, lo anota en
+`launcher.log`.
 
 ### Barra en el navegador (Chrome / Edge / Brave / Helium)
 
@@ -73,9 +81,11 @@ copiada y el protocolo `ytdl://` registrado, que es lo que la extensión necesit
 | Qué | Dónde |
 |---|---|
 | Programa | `%LOCALAPPDATA%\IndieDL\` |
+| Lanzador | `%LOCALAPPDATA%\IndieDL\launcher.pyw` |
 | Entorno virtual | `%LOCALAPPDATA%\IndieDL\venv\` |
 | Configuración | `%LOCALAPPDATA%\IndieDL\config.json` |
 | Registro de errores | `%LOCALAPPDATA%\IndieDL\indiedl.log` |
+| Registro del lanzador | `%LOCALAPPDATA%\IndieDL\launcher.log` |
 | Temporales de descarga | `%LOCALAPPDATA%\IndieDL\tmp\` |
 | Extensión | `%LOCALAPPDATA%\IndieDL\browser-extension\` |
 
@@ -103,6 +113,7 @@ IndieDL y recargá la pestaña.
 indiedl/
 ├─ app/
 │  ├─ indiedl.py            # aplicación (interfaz + descarga)
+│  ├─ launcher.pyw          # lanzador: corrige la integridad y abre la app
 │  └─ analizar_media.py     # metadatos y duración vía FFmpeg
 ├─ installer/
 │  └─ instalar.ps1          # lógica del instalador
@@ -112,13 +123,18 @@ indiedl/
 │  ├─ clipboard-hook.js
 │  └─ README.md
 ├─ requirements.txt
-├─ INSTALAR.bat             # instalador (doble clic)
-└─ Iniciar IndieDL.bat
+└─ INSTALAR.bat             # instalador (doble clic)
 ```
 
 ---
 
 ## Problemas comunes
+
+**Error de permisos (Errno 13) al guardar la descarga**
+Suele ser que la carpeta `%LOCALAPPDATA%\IndieDL` quedó con etiqueta de integridad baja.
+Abrí la app desde el acceso directo (el lanzador la corrige solo) o ejecutá `INSTALAR.bat`
+otra vez. Para revisarlo a mano: `icacls "%LOCALAPPDATA%\IndieDL"` (buscá una línea de
+etiqueta obligatoria de nivel bajo). Si hay algo más, mirá `launcher.log`.
 
 **«Falta yt-dlp» o falla la descarga de YouTube**
 La app actualiza sola la nightly de yt-dlp una vez por día, justo antes de la primera descarga (puede tardar unos segundos esa primera vez). Si el error sigue, corré:
@@ -135,6 +151,10 @@ soportados. Si usabas el userscript de Violentmonkey, desactivalo para que no se
 **FFmpeg no aparece**
 `winget install --id Gyan.FFmpeg -e`  ·  o reinstalá con `INSTALAR.bat` (la app tiene
 fallback propio y funciona sin FFmpeg en el PATH).
+
+**«No esta instalado» al abrir desde el navegador**
+Faltan el entorno virtual o `indiedl.py` en `%LOCALAPPDATA%\IndieDL`. Ejecutá `INSTALAR.bat`.
+Si desinstalaste el Python base, también hay que volver a ejecutarlo para registrar `ytdl://`.
 
 ---
 
