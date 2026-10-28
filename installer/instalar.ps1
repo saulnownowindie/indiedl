@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
     Indie Now DL - instalador automatico
     ------------------------------------
@@ -41,6 +41,34 @@ function Detalle { param([string]$t) Write-Host "     $t" -ForegroundColor DarkG
 function Bien  { param([string]$t) Write-Host "     OK   $t" -ForegroundColor Green }
 function Aviso { param([string]$t) Write-Host "     !    $t" -ForegroundColor Yellow }
 function Mal   { param([string]$t) Write-Host "     X    $t" -ForegroundColor Red }
+
+# FIX: quita la etiqueta de integridad BAJA de la carpeta de la app.
+# Con esa etiqueta, python.exe del venv arranca como proceso de integridad
+# baja y no puede escribir en D:\, Escritorio, etc. (Errno 13 al guardar).
+# Se aplica a la carpeta y a todo lo que contiene (el venv hereda la etiqueta).
+function Fix-Integrity {
+    try {
+        & icacls $AppDir /setintegritylevel '(OI)(CI)M' /T /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { Aviso "icacls devolvio codigo $LASTEXITCODE al normalizar la integridad." }
+    } catch {
+        Aviso "No se pudo normalizar la integridad: $($_.Exception.Message)"
+    }
+}
+
+# FIX: prueba real. El python del venv debe poder escribir fuera de IndieDL.
+function Probar-Escritura {
+    $probe = Join-Path $env:TEMP ("indiedl_probe_{0}.txt" -f [guid]::NewGuid())
+    $env:IDL_PROBE = $probe
+    try {
+        & $VenvPy -c "import os;open(os.environ['IDL_PROBE'],'w').write('x')" 2>$null | Out-Null
+    } catch { }
+    Remove-Item Env:IDL_PROBE -ErrorAction SilentlyContinue
+    if (Test-Path $probe) {
+        Remove-Item $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    return $false
+}
 
 function Refrescar-Ruta {
     $maquina = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -168,6 +196,7 @@ if ($py) {
 
 Paso '2/6  Carpeta de la aplicacion'
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+Fix-Integrity   # FIX: antes de crear el venv, para que herede la etiqueta normal
 Bien $AppDir
 
 Paso '3/6  Entorno virtual'
@@ -187,6 +216,15 @@ if (Test-Path $VenvPy) {
 Paso '4/6  Dependencias'
 Instalar-Requisitos
 Bien 'customtkinter, Pillow, yt-dlp, gallery-dl, imageio-ffmpeg'
+
+# FIX: normaliza otra vez (venv ya existente o algo creado con etiqueta baja) y verifica
+Fix-Integrity
+if (Probar-Escritura) {
+    Bien 'El entorno puede guardar en carpetas normales (D:\, Escritorio, etc.)'
+} else {
+    Mal 'El python del entorno NO puede escribir fuera de la carpeta de IndieDL.'
+    Mal "Revisa: icacls `"$AppDir`" | findstr Mandatory"
+}
 
 Paso '5/6  Archivos de la aplicacion'
 Copy-Item (Join-Path $RepoDir 'app\indiedl.py') $AppDir -Force
