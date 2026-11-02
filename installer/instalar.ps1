@@ -240,9 +240,12 @@ if (Probar-Escritura) {
 }
 
 Paso '5/6  Archivos de la aplicacion'
-Copy-Item (Join-Path $RepoDir 'app\indiedl.py') $AppDir -Force
-Copy-Item (Join-Path $RepoDir 'app\analizar_media.py') $AppDir -Force
-Copy-Item (Join-Path $RepoDir 'app\launcher.pyw') $AppDir -Force
+$appFiles = @('indiedl.py', 'indiedl_core.py', 'indiedl_ui.py', 'analizar_media.py', 'launcher.pyw')
+foreach ($name in $appFiles) {
+    $src = Join-Path (Join-Path $RepoDir 'app') $name
+    if (-not (Test-Path $src)) { throw "Falta el archivo de la aplicacion: $src" }
+    Copy-Item $src $AppDir -Force
+}
 $extDst = Join-Path $AppDir 'browser-extension'
 New-Item -ItemType Directory -Force -Path $extDst | Out-Null
 Copy-Item (Join-Path $RepoDir 'browser-extension\*') $extDst -Force

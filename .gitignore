@@ -1,41 +1,25 @@
-# ── Datos de ejecución (nunca subir) ──────────────────────────
-config.json
-indiedl.log
-indiedl.log.old
-cookies*.txt
-instagram_cookies.txt
-youtube_cookies.txt
-tmp/
-cache/
-*.7z
-
-# ── Python ────────────────────────────────────────────────────
+# Entornos y artefactos de build
+venv/
 __pycache__/
 *.py[cod]
-*.egg-info/
-.venv/
-venv/
-env/
-
-# ── Compilados ────────────────────────────────────────────────
 build/
 dist/
-*.spec.bak
+dist_anterior/
+_archive/
+_updates/
 
-# ── Copias de seguridad locales ───────────────────────────────
+# Datos locales y secretos
+config.json
+*_config.json
+*_cache.json
+*cookies*.txt
+cookies.7z
+*.log
+tmp/
+cache/
+
+# Backups y empaquetados de trabajo
 *.bak
-*.pre-*
-*.before-*
-
-# ── Sistema ───────────────────────────────────────────────────
-Thumbs.db
-desktop.ini
-.DS_Store
-
-# ── Editor ────────────────────────────────────────────────────
-.vscode/*
-!.vscode/extensions.json
-*.indiedl_tmp.*
-*.indiedl_h264.*
-**/config.json
-*.spec
+*.7z
+*.dpx
+*.drx

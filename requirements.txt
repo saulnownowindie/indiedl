@@ -1,8 +1,12 @@
-# Indie Now DL — dependencias de ejecución
-# Instaladas automáticamente por INSTALAR.bat dentro de %LOCALAPPDATA%\IndieDL\venv
-
-customtkinter>=6.0,<7
-pillow>=10
-yt-dlp[default,curl-cffi]>=2025.10.22
-gallery-dl>=1.28
-imageio-ffmpeg>=0.5
+# IndieDL - dependencias de la aplicacion principal
+# Instalacion:  pip install -r requirements.txt
+--pre
+customtkinter==6.0.0
+pillow==13.0.0
+yt-dlp[default,curl-cffi]==2026.10.29.232701.dev0
+gallery-dl==1.32.18
+imageio-ffmpeg==0.7.0
+mutagen==1.48.1
+requests==2.34.2
+websockets==17.3
+curl-cffi==0.16.3
