@@ -1838,16 +1838,20 @@ def generar(cfg, progreso):
             if not pares: aviso_trad = "No hay texto para traducir."
             else:
                 origen = idioma_audio if idioma_audio != "auto" else (_idioma_detectado or "auto")
-                # Traducir oraciones completas: da gramática y pronombres
-                # coherentes; después cada oración se reparte en su audio.
-                oraciones = _agrupar_oraciones([u for u, _ in pares],
-                                               [t for _, t in pares])
-                try:
-                    traducciones = traducir_lineas([t for _, t in oraciones], origen,
-                                                   destino, progreso)
-                    bloques_trad = bloques_traduccion([u for u, _ in oraciones],
-                                                      traducciones, estilo_trad)
-                except Exception as ex: aviso_trad = f"No pude traducir: {ex}"
+                if origen and origen != "auto" and origen == destino:
+                    aviso_trad = (f"El audio ya está en {NOMBRES_IDIOMA.get(destino, destino)}: "
+                                  "no hace falta una pista traducida.")
+                else:
+                    # Traducir oraciones completas: da gramática y pronombres
+                    # coherentes; después cada oración se reparte en su audio.
+                    oraciones = _agrupar_oraciones([u for u, _ in pares],
+                                                   [t for _, t in pares])
+                    try:
+                        traducciones = traducir_lineas([t for _, t in oraciones], origen,
+                                                       destino, progreso)
+                        bloques_trad = bloques_traduccion([u for u, _ in oraciones],
+                                                          traducciones, estilo_trad)
+                    except Exception as ex: aviso_trad = f"No pude traducir: {ex}"
         if hacer_comp:
             progreso(88, "Comparando con el guion...")
             try: resumen_comp = comparar_con_guion(pal, guion, segs, f_ini, cfg)
