@@ -18,8 +18,11 @@ cookies.7z
 tmp/
 cache/
 
-# Backups y empaquetados de trabajo
+# Backup y empaquetados de trabajo
 *.bak
 *.7z
 *.dpx
 *.drx
+
+# Instalacion de la app de subtitulos (vive en saulnownowindie/subs-now)
+subs/
