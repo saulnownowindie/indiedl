@@ -15,7 +15,7 @@ indiedl_ui.py           Interfaz CustomTkinter (SmoothScroll, App)
 launcher.pyw            Lanzador que corrige la etiqueta de integridad de Windows
 analizar_media.py       Diagnóstico de un video para DaVinci Resolve
 requirements.txt        Dependencias de la app principal
-requirements-subs.txt   Dependencias de subtítulos/cortes (opcional)
+requirements-subs.txt   Dependencias de cortes con Whisper (opcional)
 
 app/                    Copia que usa el instalador como payload
 browser-extension/      Extensión de Chrome/Edge (protocolo ytdl://)
