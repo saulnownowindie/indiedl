@@ -251,19 +251,8 @@ New-Item -ItemType Directory -Force -Path $extDst | Out-Null
 Copy-Item (Join-Path $RepoDir 'browser-extension\*') $extDst -Force
 Bien "App y extension copiadas a $AppDir"
 
-# Lanzador de subtitulos para DaVinci Resolve (menu Fusion > Scripts > Edit)
-$resolveRoot = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve'
-$resolveEdit = Join-Path $resolveRoot 'Support\Fusion\Scripts\Edit'
-$subsLauncher = Join-Path $RepoDir 'subs\SubsSaul.py'
-if ((Test-Path $resolveRoot) -and (Test-Path $subsLauncher)) {
-    New-Item -ItemType Directory -Force -Path $resolveEdit | Out-Null
-    Copy-Item $subsLauncher (Join-Path $resolveEdit 'SubsSaul.py') -Force
-    Bien 'Lanzador de subtitulos instalado en DaVinci Resolve'
-} elseif (Test-Path $resolveRoot) {
-    Aviso 'No se encontro subs\SubsSaul.py para instalar en Resolve.'
-} else {
-    Aviso 'DaVinci Resolve no detectado; el lanzador de subtitulos no se copio.'
-}
+# La app de subtitulos vive en su propio repo (saulnownowindie/subs-now).
+# Su INSTALAR.bat copia el lanzador SubsSaul.py al menu Fusion > Scripts > Edit.
 
 $ff = Asegurar-FFmpeg
 if ($ff) {
