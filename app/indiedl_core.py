@@ -1207,11 +1207,20 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 opts["download_sections"] = [f"*{section[0]}-{section[1]}"]
                 opts["force_keyframes_at_cuts"] = True
         elif mode == "audio":
-            opts.update(format="bestaudio/best", postprocessors=[{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": quality or AUDIO_CODEC, "preferredquality": AUDIO_QUALITY}])
+            # Se descarga video+audio y despues se extrae el audio: el audio que
+            # queda es el de la fuente del video (voz + musica de fondo), no una
+            # pista suelta elegida como "bestaudio" (que en TikTok puede traer solo
+            # la cancion de fondo en vez del audio real del video).
+            opts.update({
+                "format": ("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b"),
+                "merge_output_format": "mp4",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": quality or AUDIO_CODEC, "preferredquality": AUDIO_QUALITY}],
+            })
             if section:
                 opts["download_sections"] = [f"*{section[0]}-{section[1]}"]
+                opts["force_keyframes_at_cuts"] = True
         else:
             raise RuntimeError("Modo imagen debe ir por gallery-dl.")
 
@@ -1252,6 +1261,10 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
 
         if final and os.path.isfile(final):
             final = safe_media_name(final, q)
+        if mode in ("video", "audio"):
+            q.put(("log", "Formato de descarga: " + str(opts.get("format") or "-")))
+            res_fmt = (res or {}).get("format") if isinstance(res, dict) else None
+            q.put(("log", "Formato resuelto: " + str(res_fmt or (res or {}).get("format_id") or "-")))
         if mode == "video" and final and ff:
             final = ensure_h264(ff, final, q)
             if cfg.get("pcm_resolve", False):
