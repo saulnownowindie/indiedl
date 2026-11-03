@@ -58,6 +58,13 @@ SOLO = "(SRT como pista de subtítulos)"
 NOMBRES_IDIOMA = {
     "es": "español", "en": "inglés", "pt": "portugués",
     "fr": "francés", "it": "italiano", "de": "alemán",
+    "ja": "japonés", "ko": "coreano", "zh": "chino",
+    "ru": "ruso", "ar": "árabe", "hi": "hindi",
+    "tr": "turco", "id": "indonesio", "nl": "neerlandés",
+    "pl": "polaco", "sv": "sueco", "uk": "ucraniano",
+    "vi": "vietnamita", "th": "tailandés", "he": "hebreo",
+    "el": "griego", "cs": "checo", "ro": "rumano",
+    "hu": "húngaro", "da": "danés", "fi": "finés", "no": "noruego",
 }
 IDIOMAS_VALIDOS = ("auto",) + tuple(NOMBRES_IDIOMA)
 ESTILOS_TRAD = ("palabras", "frases")
@@ -747,10 +754,61 @@ _ultimos = []
 _idioma_detectado = ""
 
 
+def _sin_habla(texto):
+    """Línea que no es habla: [Música], (risas), ♪ o solo signos.
+
+    Concat descarta estas líneas antes de armar los subtítulos: Whisper las
+    inventa sobre música y silencio y ensucian el SRT.
+    """
+    t = (texto or "").strip()
+    if not t:
+        return True
+    if (t.startswith("[") and t.endswith("]")) or (t.startswith("(") and t.endswith(")")):
+        return True
+    return not any(c.isalnum() for c in t)
+
+
+# Concat: un tramo que se repite 3 veces o más y cubre 6 palabras o más es
+# un bucle de Whisper, no algo que se haya dicho. Se deja la última vuelta.
+_LOOP_UNIDAD = 8
+_LOOP_MINIMO = 6
+
+
+def quitar_loops(palabras):
+    """Quita frases que Whisper repite en bucle dentro de una misma línea."""
+    if not palabras:
+        return palabras
+    planos = [norm(p[0]) for p in palabras]
+    total = len(palabras)
+    salida, i = [], 0
+    while i < total:
+        mejor = None
+        for unidad in range(1, min(_LOOP_UNIDAD, total - i) + 1):
+            veces = 1
+            while i + (veces + 1) * unidad <= total and all(
+                    planos[i + k] == planos[i + veces * unidad + k]
+                    for k in range(unidad)):
+                veces += 1
+            cubre = veces * unidad
+            if veces >= 3 and cubre >= _LOOP_MINIMO and (
+                    mejor is None or cubre > mejor[0] * mejor[1]):
+                mejor = (unidad, veces)
+        if mejor:
+            unidad, veces = mejor
+            ultimo = i + (veces - 1) * unidad
+            salida.extend(palabras[ultimo:ultimo + unidad])
+            i += veces * unidad
+        else:
+            salida.append(palabras[i])
+            i += 1
+    return salida
+
+
 def es_alucinacion(seg, estricto=True):
     t = norm(seg.text)
     _ultimos.append(t)
     del _ultimos[:-3]
+    if _sin_habla(seg.text): return True
     if any(b in t for b in ALUCINACIONES): return True
     if not estricto: return False
     if t == "gracias": return True
@@ -796,7 +854,13 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma=
     if language is None:
         try:
             mejor = max(segs, key=lambda sg: os.path.getsize(sg[0]))
-            det = model.detect_language(cargar_wav(mejor[0])[:16000 * 30])
+            # Concat: el idioma se escucha sobre varias ventanas de voz, no
+            # sobre los primeros segundos (que suelen ser música o intro).
+            muestra = cargar_wav(mejor[0])[:16000 * 90]
+            try:
+                det = model.detect_language(muestra, language_detection_segments=3)
+            except TypeError:
+                det = model.detect_language(muestra)
             if det and det[0]:
                 language = str(det[0]); _idioma_detectado = language
                 _log(f"Idioma fijado para todos los clips: {language}")
@@ -830,6 +894,8 @@ def transcribir(segs, prompt, progreso, modelo=None, p_ini=30, p_fin=90, idioma=
         progreso(p_fin, "Buscando palabras que faltan…")
         try: palabras = recuperar_huecos(palabras, segs, modelo_actual, language, prompt or "", velocidad=1.0)
         except Exception as exc: _log(f"[recuperar] error: {type(exc).__name__}: {exc}")
+        try: palabras = quitar_loops(palabras)
+        except Exception as exc: _log(f"[loops] error: {type(exc).__name__}: {exc}")
         return palabras
 
     try:
@@ -1013,10 +1079,41 @@ def _guardar_texto(path, contenido):
                 pass
 
 
+def _envolver_srt(texto, ancho=42):
+    """Parte el texto en dos líneas legibles, como Concat (42 caracteres).
+
+    Una línea de 80 caracteres en pantalla se sale del cuadro. Se corta en
+    un espacio cerca de la mitad; si hace falta, se envuelve por ancho.
+    """
+    texto = " ".join(str(texto or "").split())
+    if len(texto) <= ancho:
+        return texto
+    if len(texto) <= 2 * ancho + 1:
+        mitad = len(texto) / 2.0
+        mejor = None
+        for i, ch in enumerate(texto):
+            if ch == " " and (mejor is None or abs(i - mitad) < abs(mejor - mitad)):
+                mejor = i
+        if mejor is not None and 0 < mejor < len(texto) - 1:
+            return texto[:mejor].rstrip() + "\n" + texto[mejor + 1:].lstrip()
+    lineas, actual = [], ""
+    for palabra in texto.split():
+        if not actual:
+            actual = palabra
+        elif len(actual) + 1 + len(palabra) <= ancho:
+            actual += " " + palabra
+        else:
+            lineas.append(actual)
+            actual = palabra
+    if actual:
+        lineas.append(actual)
+    return "\n".join(lineas)
+
+
 def escribir_srt(bloques, path):
     partes = []
     for n, (t, s, e) in enumerate(bloques, 1):
-        partes.append(f"{n}\n{tc(s)} --> {tc(e)}\n<b>{t}</b>\n\n")
+        partes.append(f"{n}\n{tc(s)} --> {tc(e)}\n<b>{_envolver_srt(t)}</b>\n\n")
     return _guardar_texto(path, "".join(partes))
 
 
@@ -1109,7 +1206,8 @@ def traducir_lineas(lineas, origen, destino, progreso=None):
     while i < total:
         lote = []
         caracteres = 0
-        while i < total and len(lote) < 12 and (caracteres < 1400 or not lote):
+        # Oraciones completas: menos viajes y más contexto por llamada.
+        while i < total and len(lote) < 16 and (caracteres < 3000 or not lote):
             item = pendientes[i]
             lote.append(item)
             caracteres += len(item[1]) + 1
@@ -1117,7 +1215,7 @@ def traducir_lineas(lineas, origen, destino, progreso=None):
         resultado = _google_lote([t for _, t in lote], origen, destino)
         if len(resultado) != len(lote): raise RuntimeError("La traducción no devolvió la misma cantidad de líneas.")
         for (indice, texto), trad in zip(lote, resultado):
-            trad = (trad or "").strip() or texto
+            trad = re.sub(r"\s+", " ", (trad or "")).strip() or texto
             cache[f"{origen}>{destino}|{texto}"] = trad
             salida[indice] = trad
         hechos += len(lote)
@@ -1171,31 +1269,132 @@ def _partir_palabras(texto, duracion):
     return [" ".join(palabras[i:i + tam]) for i in range(0, len(palabras), tam)]
 
 
-def bloques_traduccion(unidades, traducciones, estilo="palabras"):
+def _agrupar_oraciones(unidades, textos, max_chars=320, max_dur=12.0, max_gap=1.2):
+    """Une fragmentos de una misma oración para traducir con contexto.
+
+    Traducir "Me dijo que" / "no iba a venir" por separado destroza la
+    gramática: Google no sabe quién habla ni en qué tiempo. Concat no
+    traduce (transcribe en el idioma pedido), pero la lección es la misma:
+    el texto se procesa en oraciones completas y después se reparte en el
+    tiempo de cada fragmento.
+    """
+    grupos, cur_u, cur_t = [], [], []
+    ini = fin = None
+    for unidad, texto in zip(unidades, textos):
+        if not unidad:
+            continue
+        u_ini, u_fin = float(unidad[0][1]), float(unidad[-1][2])
+        if cur_u:
+            anterior = cur_t[-1].strip()
+            hueco = u_ini - fin
+            dura = u_fin - ini
+            if (_FIN_FRASE.search(anterior) or hueco >= max_gap
+                    or len(" ".join(cur_t)) >= max_chars or dura >= max_dur):
+                grupos.append((cur_u, " ".join(cur_t)))
+                cur_u, cur_t, ini = [], [], None
+        if not cur_u:
+            ini = u_ini
+        cur_u.append(unidad)
+        cur_t.append(texto)
+        fin = u_fin
+    if cur_u:
+        grupos.append((cur_u, " ".join(cur_t)))
+    return grupos
+
+
+def _repartir_texto(texto, n):
+    """Parte una traducción en n trozos en límites de palabra.
+
+    Los cortes se buscan cerca de la posición proporcional, así cada trozo
+    cae sobre el fragmento de audio que le corresponde sin partir palabras.
+    """
+    texto = " ".join(str(texto or "").split())
+    if n <= 1 or not texto:
+        return [texto] * max(1, n)
+    if len(texto) <= n:
+        return [texto] + [""] * (n - 1)
+    cortes, inicio = [], 0
+    for k in range(1, n):
+        objetivo = round(len(texto) * k / n)
+        ventana = max(2, len(texto) // (n * 2))
+        lo = max(inicio + 1, objetivo - ventana)
+        hi = min(len(texto) - 1, objetivo + ventana)
+        mejor = None
+        for j in range(lo, hi + 1):
+            if texto[j] in " ,;:":
+                if mejor is None or abs(j - objetivo) < abs(mejor - objetivo):
+                    mejor = j
+        if mejor is None:
+            mejor = texto.rfind(" ", inicio + 1, objetivo)
+            if mejor <= inicio:
+                mejor = texto.find(" ", objetivo)
+            if mejor <= inicio or mejor >= len(texto):
+                mejor = objetivo
+        cortes.append(mejor)
+        inicio = mejor + 1
+    partes, previo = [], 0
+    for c in cortes:
+        partes.append(texto[previo:c].strip(" ,;:"))
+        previo = c + 1
+    partes.append(texto[previo:].strip(" ,;:"))
+    return partes
+
+
+def ajustar_ritmo(bloques, cps=17.0, min_dur=0.6, max_dur=8.0):
+    """Da tiempo de lectura: un subtítulo largo no puede durar 0,3 s.
+
+    Igual que Concat, se calcula lo que lleva leerlo (17 caracteres por
+    segundo) y se estira hasta el inicio del siguiente subtítulo.
+    """
+    total = len(bloques)
+    for i, b in enumerate(bloques):
+        try:
+            dur = float(b[2]) - float(b[1])
+            necesario = min(max_dur, max(min_dur, len(str(b[0])) / cps))
+        except (TypeError, ValueError):
+            continue
+        if dur >= necesario:
+            continue
+        limite = (float(bloques[i + 1][1]) - 0.04) if i + 1 < total else float(b[1]) + necesario
+        b[2] = max(float(b[2]), min(limite, float(b[1]) + necesario))
+    return bloques
+
+
+def bloques_traduccion(grupos, traducciones, estilo="palabras"):
+    """Reparte cada oración traducida sobre el audio de sus fragmentos."""
     bloques = []
-    for unidad, texto in zip(unidades, traducciones):
+    for unidades, texto in zip(grupos, traducciones):
         texto = (texto or "").strip()
-        if not texto or not unidad: continue
-        inicio = float(unidad[0][1])
-        final = float(unidad[-1][2])
-        if final <= inicio: final = inicio + 0.4
-        dur = max(0.3, final - inicio)
-        partes = (_partir_palabras(texto, dur) if estilo == "palabras" else _partir_frases(texto))
-        if not partes: continue
-        pesos = [max(1, len(p)) for p in partes]
-        total = sum(pesos)
-        t = inicio
-        for k, parte in enumerate(partes):
-            if k == len(partes) - 1: fin = final
-            else: fin = min(final, t + dur * pesos[k] / total)
-            if fin <= t: fin = t + 0.15
-            bloques.append([parte, t, fin])
-            t = fin
+        if not texto or not unidades:
+            continue
+        partes = _repartir_texto(texto, len(unidades))
+        for unidad, parte in zip(unidades, partes):
+            parte = (parte or "").strip(" ,;:-")
+            if not parte:
+                continue
+            inicio = float(unidad[0][1])
+            final = float(unidad[-1][2])
+            if final <= inicio: final = inicio + 0.4
+            dur = max(0.3, final - inicio)
+            trozos = (_partir_palabras(parte, dur) if estilo == "palabras"
+                      else _partir_frases(parte))
+            if not trozos:
+                continue
+            pesos = [max(1, len(p)) for p in trozos]
+            total = sum(pesos)
+            t = inicio
+            for k, trozo in enumerate(trozos):
+                if k == len(trozos) - 1: fin = final
+                else: fin = min(final, t + dur * pesos[k] / total)
+                if fin <= t: fin = t + 0.15
+                bloques.append([trozo, t, fin])
+                t = fin
     for k in range(len(bloques) - 1):
-        if bloques[k][2] > bloques[k + 1][1]: bloques[k][2] = bloques[k + 1][1]
+        if bloques[k][2] > bloques[k + 1][1]:
+            bloques[k][2] = max(bloques[k][1] + 0.1, bloques[k + 1][1])
     for b in bloques:
         if b[2] <= b[1]: b[2] = b[1] + 0.15
-    return bloques
+    return ajustar_ritmo(bloques)
 
 
 def _respaldar(ruta):
@@ -1639,9 +1838,15 @@ def generar(cfg, progreso):
             if not pares: aviso_trad = "No hay texto para traducir."
             else:
                 origen = idioma_audio if idioma_audio != "auto" else (_idioma_detectado or "auto")
+                # Traducir oraciones completas: da gramática y pronombres
+                # coherentes; después cada oración se reparte en su audio.
+                oraciones = _agrupar_oraciones([u for u, _ in pares],
+                                               [t for _, t in pares])
                 try:
-                    traducciones = traducir_lineas([t for _, t in pares], origen, destino, progreso)
-                    bloques_trad = bloques_traduccion([u for u, _ in pares], traducciones, estilo_trad)
+                    traducciones = traducir_lineas([t for _, t in oraciones], origen,
+                                                   destino, progreso)
+                    bloques_trad = bloques_traduccion([u for u, _ in oraciones],
+                                                      traducciones, estilo_trad)
                 except Exception as ex: aviso_trad = f"No pude traducir: {ex}"
         if hacer_comp:
             progreso(88, "Comparando con el guion...")

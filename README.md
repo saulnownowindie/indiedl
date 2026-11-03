@@ -46,8 +46,20 @@ venv\Scripts\pythonw.exe indiedl.py
 ```bat
 pip install -r requirements-subs.txt
 cd subs
-venv\Scripts\python.exe subtitulos.py
+..\venv\Scripts\pythonw.exe subtitulos.py
 ```
+
+Desde DaVinci Resolve: **Fusion → Scripts → Edit → SubsSaul**.
+El lanzador usa `venv\Scripts\pythonw.exe` y deja diagnóstico en
+`subs\lanzador.log`. El instalador lo copia automáticamente.
+
+La traducción trabaja por oraciones completas (mejor gramática y
+pronombres), reparte el texto sobre el tiempo real de cada frase, respeta
+tiempos de lectura y parte el SRT en dos líneas de 42 caracteres. Idiomas:
+español, inglés, portugués, francés, italiano, alemán, japonés, coreano,
+chino, ruso, árabe, hindi, turco, indonesio, neerlandés, polaco, sueco,
+ucraniano, vietnamita, tailandés, hebreo, griego, checo, rumano, húngaro,
+danés, finés y noruego.
 
 ## Seguridad
 

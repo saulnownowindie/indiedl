@@ -29,12 +29,16 @@ ESTADOS = {
 IDIOMAS_AUDIO = [
     ("auto", "AUTOMÁTICO"), ("es", "ESPAÑOL"), ("en", "INGLÉS"),
     ("pt", "PORTUGUÉS"), ("fr", "FRANCÉS"), ("it", "ITALIANO"),
-    ("de", "ALEMÁN"),
+    ("de", "ALEMÁN"), ("ja", "JAPONÉS"), ("ko", "COREANO"),
+    ("zh", "CHINO"), ("ru", "RUSO"), ("ar", "ÁRABE"),
+    ("hi", "HINDI"), ("tr", "TURCO"), ("id", "INDONESIO"),
+    ("nl", "NEERLANDÉS"), ("pl", "POLACO"), ("sv", "SUECO"),
+    ("uk", "UCRANIANO"), ("vi", "VIETNAMITA"), ("th", "TAILANDÉS"),
+    ("he", "HEBREO"), ("el", "GRIEGO"), ("cs", "CHECO"),
+    ("ro", "RUMANO"), ("hu", "HÚNGARO"), ("da", "DANÉS"),
+    ("fi", "FINÉS"), ("no", "NORUEGO"),
 ]
-IDIOMAS_DESTINO = [
-    ("es", "ESPAÑOL"), ("en", "INGLÉS"), ("pt", "PORTUGUÉS"),
-    ("fr", "FRANCÉS"), ("it", "ITALIANO"), ("de", "ALEMÁN"),
-]
+IDIOMAS_DESTINO = [par for par in IDIOMAS_AUDIO if par[0] != "auto"]
 
 
 def _corto(texto, limite=46):
