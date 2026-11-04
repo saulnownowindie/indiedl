@@ -344,6 +344,16 @@ def vfmt(q):
     return (f"bv*[height<={h}][vcodec^=avc1][dynamic_range=SDR]+ba[acodec^=mp4a]/"
             f"bv*[height<={h}][dynamic_range=SDR]+ba/b[height<={h}]")
 
+def tiktok_fmt(q):
+    """TikTok: usar SOLO el archivo combinado (video + audio original).
+    Si se pide 'ba' (mejor audio), yt-dlp puede agarrar la cancion de fondo
+    suelta y el merge reemplaza la voz del video por esa musica."""
+    h = {"1080p": 1080, "720p": 720}.get(q)
+    hf = f"[height<={h}]" if h else ""
+    both = "[acodec!=none][vcodec!=none]"
+    return (f"b{both}{hf}[vcodec^=avc1]/b{both}{hf}/"
+            f"b{both}[vcodec^=avc1]/b{both}/b")
+
 def fb(n):
     if not n:
         return "-"
@@ -1223,6 +1233,8 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 opts["force_keyframes_at_cuts"] = True
         else:
             raise RuntimeError("Modo imagen debe ir por gallery-dl.")
+        if "tiktok.com" in url.lower() and mode in ("video", "audio"):
+            opts["format"] = tiktok_fmt(quality if mode == "video" else None)
 
         res = None
         if cached_info and mode in ("video", "audio"):
@@ -1423,4 +1435,3 @@ def cached_header(w=1040, h=120):
     except Exception as exc:
         log(f"cached_header guardado: {exc!r}")
     return img
-
