@@ -40,6 +40,7 @@ DEFAULTS = {
     "audio_fmt": "mp3",
     "pcm_resolve": False,
     "open_folder_done": False,
+    "usar_parakeet": True,
     "history": [],
 }
 
@@ -121,14 +122,24 @@ def parse_batch(uri):
     if not m:
         return None
     items, seen = [], set()
+    current = None
+    
     for k, v in parse_qsl(m.group(1), keep_blank_values=True):
         if k == "u":
             u = clean_url(v)
             if u and u not in seen:
                 seen.add(u)
-                items.append({"url": u, "title": ""})
-        elif k == "t" and items and not items[-1]["title"]:
-            items[-1]["title"] = v.strip()[:120]
+                current = {"url": u, "title": "", "s": None, "e": None}
+                items.append(current)
+        elif k == "t" and current and not current["title"]:
+            current["title"] = v.strip()[:120]
+        elif k == "s" and current:
+            try: current["s"] = int(v)
+            except ValueError: pass
+        elif k == "e" and current:
+            try: current["e"] = int(v)
+            except ValueError: pass
+            
     return items[:MAX_BATCH] or None
 
 class ForwardQ:
@@ -152,8 +163,6 @@ def register():
     here = Path(__file__).resolve()
     launcher = here.with_name("launcher.pyw")
     if launcher.exists():
-        # El lanzador corre con el pythonw del Python BASE (no el del venv): asi
-        # no hereda una etiqueta de integridad baja y puede corregirla.
         base = Path(sys.base_prefix) / "pythonw.exe"
         host = base if base.exists() else pyw
         cmd = f'"{host}" "{launcher}" "%1"'
@@ -197,7 +206,6 @@ def media_duration(ff, path):
     return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
 
 def enforce_clip(ff, path, section, mode, quality, q):
-    """Verify yt-dlp actually returned the requested range; cut locally if it didn't."""
     start, end = section
     wanted = max(0.0, float(end) - float(start))
     duration = media_duration(ff, path)
@@ -343,16 +351,6 @@ def vfmt(q):
                 "bv*[dynamic_range=SDR]+ba/b[ext=mp4]/bv*+ba/b")
     return (f"bv*[height<={h}][vcodec^=avc1][dynamic_range=SDR]+ba[acodec^=mp4a]/"
             f"bv*[height<={h}][dynamic_range=SDR]+ba/b[height<={h}]")
-
-def tiktok_fmt(q):
-    """TikTok: usar SOLO el archivo combinado (video + audio original).
-    Si se pide 'ba' (mejor audio), yt-dlp puede agarrar la cancion de fondo
-    suelta y el merge reemplaza la voz del video por esa musica."""
-    h = {"1080p": 1080, "720p": 720}.get(q)
-    hf = f"[height<={h}]" if h else ""
-    both = "[acodec!=none][vcodec!=none]"
-    return (f"b{both}{hf}[vcodec^=avc1]/b{both}{hf}/"
-            f"b{both}[vcodec^=avc1]/b{both}/b")
 
 def fb(n):
     if not n:
@@ -778,13 +776,62 @@ def _netscape_cookie_file(path):
         return False
     return False
 
-def yt_cookie_opts(url):
+def yt_cookie_opts(url, cfg=None):
+    opts = {}
     u = str(url).lower()
-    if ("youtube.com" in u or "youtu.be" in u) and YT_COOKIES.is_file() and YT_COOKIES.stat().st_size > 0:
+
+    if "youtube.com" in u or "youtu.be" in u:
+        browser_choice = str((cfg or {}).get("cookies_browser", "auto") or "auto").lower()
+        if browser_choice != "none":
+            if browser_choice == "auto":
+                candidates = browser_profile_candidates()
+                # Incluye zen y helium que antes se ignoraban
+                for c in candidates:
+                    raw = c["browser"]
+                    if raw in ("zen", "firefox"):
+                        b = "firefox"
+                    elif raw == "helium":
+                        b = "chromium"
+                    elif raw in ("chrome", "edge", "brave"):
+                        b = raw
+                    else:
+                        continue
+                    opts["cookiesfrombrowser"] = (b, c["profile"], None, None)
+                    log(f"YouTube cookies: usando {raw} (auto) perfil={c['profile'][-40:]}")
+                    break
+            elif browser_choice in ("chrome", "edge", "firefox", "brave", "zen", "helium"):
+                b = browser_choice
+                if b == "helium":
+                    b = "chromium"
+                if b == "zen":
+                    b = "firefox"
+                # Intentar encontrar el perfil real
+                for c in browser_profile_candidates():
+                    if c["browser"] == browser_choice:
+                        opts["cookiesfrombrowser"] = (b, c["profile"], None, None)
+                        log(f"YouTube cookies: usando {b} (manual) perfil={c['profile'][-40:]}")
+                        break
+                else:
+                    opts["cookiesfrombrowser"] = (b, None, None, None)
+                    log(f"YouTube cookies: usando {b} (manual, perfil por defecto)")
+
+    elif "instagram.com" in u:
+        # Instagram necesita sesión (cookies) para ver la mayoría de posts:
+        # sin ellas yt-dlp responde "This content isn't available to everyone".
+        file_ok = cookies_file_path(cfg)
+        if file_ok:
+            opts["cookiefile"] = file_ok
+            log("Instagram cookies: usando instagram_cookies.txt")
+        else:
+            log("Instagram cookies: no hay archivo válido. Importá tu sesión "
+                "en la app (⚙ SESIÓN) o el post puede fallar con "
+                "'This content isn't available to everyone'.")
+
+    if (("youtube.com" in u or "youtu.be" in u) and YT_COOKIES.is_file()
+            and YT_COOKIES.stat().st_size > 0):
         if _netscape_cookie_file(YT_COOKIES):
-            return {"cookiefile": str(YT_COOKIES)}
-        log("youtube_cookies.txt no tiene formato Netscape válido; se ignora.")
-    return {}
+            opts["cookiefile"] = str(YT_COOKIES)
+    return opts
 
 def cookies_file_path(cfg=None):
     try:
@@ -808,10 +855,6 @@ BROWSER_PRETTY = {"helium": "Helium", "chrome": "Chrome", "edge": "Edge", "brave
                   "zen": "Zen", "firefox": "Firefox"}
 
 def _low_integrity():
-    """True si este proceso corre con integridad BAJA (no puede escribir fuera de IndieDL).
-
-    Lee el nivel del token (RID < 0x2000), asi que no depende del idioma de Windows.
-    """
     if os.name != "nt":
         return False
     try:
@@ -833,7 +876,7 @@ def _low_integrity():
             return False
         try:
             need = wintypes.DWORD(0)
-            adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(need))  # TokenIntegrityLevel
+            adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(need))
             buf = ctypes.create_string_buffer(need.value)
             if not adv.GetTokenInformation(tok, 25, buf, need, ctypes.byref(need)):
                 return False
@@ -1050,7 +1093,7 @@ def _gallery_dl_extract(url, cfg, timeout, use_cookies):
         raise RuntimeError(detail[:1300])
     return entries
 
-def gallery_dl_download(url, folder, cfg, q, cancel, image_indices=None):
+def gallery_dl_download(url, folder, cfg, q, cancel, image_indices=None, is_batch=False):
     entries = gallery_dl_extract(url, cfg)
     total = len(entries)
     chosen = list(range(1, total + 1)) if not image_indices else [int(i) for i in image_indices]
@@ -1074,9 +1117,39 @@ def gallery_dl_download(url, folder, cfg, q, cancel, image_indices=None):
             "--no-colors",
             url,
         ]
-        return subprocess.run(a, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=300, creationflags=NO_WINDOW)
+        proc = subprocess.Popen(a, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                creationflags=NO_WINDOW)
+        # Matar el proceso si se cancela.
+        def _watcher():
+            while proc.poll() is None:
+                if cancel.is_set():
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(0.2)
+        threading.Thread(target=_watcher, daemon=True).start()
+        try:
+            out, err = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            out, err = proc.communicate()
+        # Objeto compatible con subprocess.CompletedProcess
+        class _R:
+            pass
+        r = _R()
+        r.returncode = proc.returncode
+        r.stdout = out
+        r.stderr = err
+        return r
     proc = _run(True)
+    if cancel.is_set():
+        raise RuntimeError("Cancelado")
     if proc.returncode and _cookie_unreadable((proc.stderr or "") + (proc.stdout or "")) and not cookies_file_path(cfg):
         log("Cookies ilegibles al descargar; reintento sin sesión.")
         proc = _run(False)
@@ -1090,7 +1163,10 @@ def gallery_dl_download(url, folder, cfg, q, cancel, image_indices=None):
         raise RuntimeError(detail[-1100:])
     q.put(("log", f"Imágenes descargadas: {len(chosen)}"))
     q.put(("prog", 1.0, None, 0, 0, 0, len(chosen), len(chosen)))
-    q.put(("done", folder, title))
+    if not is_batch:
+        q.put(("done", folder, title))
+    else:
+        return folder, title
 
 def ensure_temp_dir():
     APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -1104,7 +1180,7 @@ def ensure_temp_dir():
     except OSError: pass
     return temp_path
 
-def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image_indices=None, cached_info=None):
+def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image_indices=None, cached_info=None, is_batch=False):
     try:
         from urllib.parse import urlparse
         parsed_url = urlparse(str(url or "").strip())
@@ -1128,8 +1204,11 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
         if section:
             q.put(("log", f"Rango In/Out solicitado: {fmt_hms(section[0])} → {fmt_hms(section[1])}"))
         if mode == "image":
-            gallery_dl_download(url, folder, cfg, q, cancel, image_indices)
-            return
+            gallery_dl_download(url, folder, cfg, q, cancel, image_indices, is_batch=is_batch)
+            if not is_batch:
+                return
+            else:
+                return folder, "Imágenes descargadas"
 
         ff = ffmpeg_path()
         if mode in ("video", "audio") and not ff:
@@ -1203,24 +1282,36 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
         
         opts = {
             "outtmpl": image_prefix + f"%(title).80s [%(id)s]{job_suffix}.%(ext)s",
-            "noplaylist": mode != "image", "quiet": True, "no_warnings": True, "noprogress": True,
-            "windowsfilenames": True, "progress_hooks": [hook], "postprocessor_hooks": [phook],
-            "concurrent_fragment_downloads": 4,
-            "paths": {"home": str(TEMP_DIR), "temp": str(TEMP_DIR)}, 
+            "noplaylist": mode != "image",
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "windowsfilenames": True,
+            "progress_hooks": [hook],
+            "postprocessor_hooks": [phook],
+            # ─── Optimizaciones de red ───
+            "concurrent_fragment_downloads": 10,
+            "http_chunk_size": 10 * 1024 * 1024,
+            "socket_timeout": 30,
+            "retries": 10,
+            "fragment_retries": 10,
+            "extractor_retries": 3,
+            "file_access_retries": 3,
+            "continuedl": True,
+            "paths": {"home": str(TEMP_DIR), "temp": str(TEMP_DIR)},
         }
+        # http_chunk_size rompe el downloader HLS (Pinterest: "Conflicting range")
+        if "youtube.com" not in str(url).lower() and "youtu.be" not in str(url).lower():
+            opts.pop("http_chunk_size", None)
         if ff:
             opts["ffmpeg_location"] = ff
-        opts.update(yt_cookie_opts(url))
+        opts.update(yt_cookie_opts(url, cfg))
         if mode == "video":
             opts.update(format=vfmt(quality), merge_output_format="mp4")
             if section:
                 opts["download_sections"] = [f"*{section[0]}-{section[1]}"]
                 opts["force_keyframes_at_cuts"] = True
         elif mode == "audio":
-            # Se descarga video+audio y despues se extrae el audio: el audio que
-            # queda es el de la fuente del video (voz + musica de fondo), no una
-            # pista suelta elegida como "bestaudio" (que en TikTok puede traer solo
-            # la cancion de fondo en vez del audio real del video).
             opts.update({
                 "format": ("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b"),
                 "merge_output_format": "mp4",
@@ -1233,8 +1324,6 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 opts["force_keyframes_at_cuts"] = True
         else:
             raise RuntimeError("Modo imagen debe ir por gallery-dl.")
-        if "tiktok.com" in url.lower() and mode in ("video", "audio"):
-            opts["format"] = tiktok_fmt(quality if mode == "video" else None)
 
         res = None
         if cached_info and mode in ("video", "audio"):
@@ -1245,8 +1334,28 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
                 q.put(("log", f"Cached info falló; reextrayendo: {type(exc).__name__}: {exc}"))
                 res = None
         if res is None:
-            with yt_dlp.YoutubeDL(opts) as y:
-                res = y.extract_info(url, download=True)
+            try:
+                with yt_dlp.YoutubeDL(opts) as y:
+                    res = y.extract_info(url, download=True)
+            except Exception as exc:
+                msg_exc = str(exc).lower()
+                es_ig = "instagram.com" in str(url).lower()
+                es_cookies_navegador = "cookiesfrombrowser" in opts
+                if ("cookie" in msg_exc and es_cookies_navegador
+                        and not es_ig):
+                    # Solo tiene sentido para cookies de navegador (pueden
+                    # estar bloqueadas por otro proceso). Con archivo de
+                    # cookies relanzar idéntico no arregla nada.
+                    q.put(("log", "No pude leer las cookies del navegador (¿abierto?); reintento sin cookies."))
+                    opts.pop("cookiesfrombrowser", None)
+                    opts.pop("cookiefile", None)
+                    with yt_dlp.YoutubeDL(opts) as y:
+                        res = y.extract_info(url, download=True)
+                else:
+                    if es_ig and "isn't available" in msg_exc and opts.get("cookiefile"):
+                        q.put(("log", "Instagram devolvió 'content isn't available' AUN con cookies: "
+                                      "la sesión puede estar vencida. Reimportá tu sesión en ⚙ SESIÓN."))
+                    raise
 
         candidates = []
         if isinstance(res, dict):
@@ -1313,7 +1422,6 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
         folder_guardado = folder
         move_exitoso = False
         try:
-            # Intentar COPIAR en lugar de MOVER suele evadir bloqueos de antivirus
             for intento in range(10):
                 try:
                     shutil.copy2(str(final_path), str(target_path))
@@ -1351,20 +1459,59 @@ def run_download(url, mode, folder, cfg, q, quality, cancel, section=None, image
             q.put(("log", "ATENCION: el archivo final NO trae pista de audio"))
         q.put(("stage", 3, "Finalizando"))
         q.put(("log", "Archivo final verificado: " + os.path.basename(final)))
-        q.put(("done", folder_guardado, st["title"] or (res or {}).get("title") or url))
+        
+        if not is_batch:
+            q.put(("done", folder_guardado, st["title"] or (res or {}).get("title") or url))
+        else:
+            return folder_guardado, st["title"] or (res or {}).get("title") or url
+            
     except Exception as e:
         err_text = str(e).replace("ERROR: ", "").strip()
         log(f"download {url}: {e!r}\n{traceback.format_exc()}")
-        if not err_text:
-            err_text = (f"Error interno de yt-dlp: {type(e).__name__}. "
-                        r"Se guardó el detalle en %LOCALAPPDATA%\IndieDL\indiedl.log.")
-        if "tiktok.com" in url.lower() and any(term in err_text.lower() for term in (
-                "unexpected response from webpage request", "solve_challenge", "challenge", "http error 403")):
-            err_text = ("TikTok rechazó la conexión o no completó el desafío con Firefox. Puede deberse a la IP/red "
-                        "(VPN, proxy, datos móviles compartidos), a un bloqueo temporal o a cambios de TikTok. "
-                        "Probá otra red y reintentá. "
-                        r"Revisá el registro en %LOCALAPPDATA%\IndieDL\indiedl.log.")
-        q.put(("err", err_text[:420]))
+        low = err_text.lower()
+
+        if "sign in to confirm your age" in low or "confirm your age" in low:
+            err_text = (
+                "YouTube pide verificación de edad para este video. "
+                "IndieDL intentó usar tus cookies del navegador pero no las aceptó. "
+                "Soluciones: (1) Abrí el video en tu navegador e iniciá sesión en YouTube. "
+                "(2) En IndieDL, abrí ⚙ SESIÓN y elegí el navegador donde estás logueado. "
+                "(3) Si usás Zen o Helium, elegilo explícitamente (no 'Auto'). "
+                "(4) Reintentá."
+            )
+        elif "this video is not available" in low or "video unavailable" in low or "private video" in low:
+            err_text = (
+                "Este video no está disponible en YouTube. "
+                "Razones posibles: el video fue eliminado por el creador, "
+                "es privado, o tiene restricción geográfica. "
+                "Probá con otro enlace."
+            )
+        elif "read timed out" in low or "timed out" in low:
+            err_text = (
+                "Los servidores de YouTube no respondieron a tiempo (read timeout). "
+                "IndieDL ya reintentó 10 veces. Posibles causas: "
+                "(1) Tu conexión a internet está lenta o inestable. "
+                "(2) YouTube te está bloqueando por hacer muchas descargas seguidas. "
+                "(3) La red de tu ISP tiene problemas con googlevideo.com. "
+                "Esperá unos minutos y reintentá."
+            )
+        elif "unexpected response from webpage request" in low or "solve_challenge" in low or "http error 403" in low:
+            if "tiktok.com" in url.lower():
+                err_text = (
+                    "TikTok rechazó la conexión. Posibles causas: "
+                    "(1) VPN/proxy. (2) Bloqueo temporal de tu IP. "
+                    "Probá otra red y reintentá."
+                )
+        elif not err_text:
+            err_text = (
+                f"Error interno de yt-dlp: {type(e).__name__}. "
+                r"Detalle en %LOCALAPPDATA%\IndieDL\indiedl.log"
+            )
+
+        if not is_batch:
+            q.put(("err", err_text[:500]))
+        else:
+            raise RuntimeError(err_text[:500])
 
 def site_name(u):
     u = u.lower()

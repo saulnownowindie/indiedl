@@ -229,6 +229,7 @@ class App(ctk.CTk):
         self.stage = -1
         self.spin_i = 0
         self.t0 = time.time()
+        self.batch_items_ui = []
         self.title("Indie Now DL")
         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
         width = min(1480, max(760, screen_w - 48))
@@ -406,6 +407,24 @@ class App(ctk.CTk):
 
     def _on_close(self):
         try:
+            if getattr(self, "busy", False):
+                try:
+                    self.cancel.set()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Marcar items de la cola como pausados/cancelados al cerrar
+        if getattr(self, "batch_mode", False) and hasattr(self, "batch_items_ui"):
+            for ui in self.batch_items_ui:
+                try:
+                    st = ui["status"]
+                    if st.cget("text") not in ("Completado",):
+                        st.configure(text="Pausado", text_color=GRAY)
+                        ui["icon"].configure(text="■", text_color=GRAY)
+                except Exception:
+                    pass
+        try:
             if getattr(self, "_close_job", None):
                 self.after_cancel(self._close_job)
                 self._close_job = None
@@ -417,6 +436,7 @@ class App(ctk.CTk):
                 self.cfg["close_when_done"] = self.v_close.get()
                 self.cfg["open_folder_done"] = self.v_open.get()
                 self.cfg["pcm_resolve"] = self.v_pcm.get()
+                self.cfg["usar_parakeet"] = self.v_parakeet.get()
                 folder = self.folder.get().strip()
                 if folder:
                     self.cfg["last_dir"] = folder
@@ -685,9 +705,11 @@ class App(ctk.CTk):
         self.v_close = ctk.BooleanVar(value=self.cfg["close_when_done"])
         self.v_pcm = ctk.BooleanVar(value=self.cfg.get("pcm_resolve", False))
         self.v_open = ctk.BooleanVar(value=self.cfg.get("open_folder_done", False))
+        self.v_parakeet = ctk.BooleanVar(value=self.cfg.get("usar_parakeet", True))
         for text, var in (("▣  Preguntar carpeta", self.v_ask), ("✓  Cerrar al terminar", self.v_close),
                           ("▤  Abrir carpeta al terminar", self.v_open),
-                          ("♫  Audio PCM (.mov)", self.v_pcm)):
+                          ("♫  Audio PCM (.mov)", self.v_pcm),
+                          ("⚡  Usar Parakeet Ultra (Experimental)", self.v_parakeet)):
             ctk.CTkCheckBox(op, text=text, variable=var, text_color=WHITE, font=("Segoe UI Semibold", 12),
                             fg_color=YEL, hover_color=YEL_H, border_color=BLACK, checkmark_color=BLACK,
                             border_width=2, corner_radius=3, checkbox_width=20,
@@ -695,7 +717,8 @@ class App(ctk.CTk):
 
         # Cada cambio de una opción se guarda al instante en config.json.
         for var, key in (("v_ask", "ask_folder"), ("v_close", "close_when_done"),
-                         ("v_open", "open_folder_done"), ("v_pcm", "pcm_resolve")):
+                         ("v_open", "open_folder_done"), ("v_pcm", "pcm_resolve"),
+                         ("v_parakeet", "usar_parakeet")):
             getattr(self, var).trace_add(
                 "write", lambda *_a, v=getattr(self, var), k=key: self._pref_changed(k, v.get()))
         self._prefs_ready = True
@@ -1029,32 +1052,143 @@ class App(ctk.CTk):
         self.folder.insert(0, folder)
         return folder
 
+    def _youtube_video_id(self, url):
+        import re as _re
+        m = _re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{6,})", str(url or ""))
+        return m.group(1) if m else None
+
+    def _youtube_oembed_info(self, url):
+        try:
+            from urllib.request import Request, urlopen
+            import json as _json
+            import urllib.parse as _up
+            oembed_url = "https://www.youtube.com/oembed?url=" + _up.quote(url, safe="") + "&format=json"
+            req = Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read().decode("utf-8", "replace"))
+            vid = self._youtube_video_id(url)
+            thumb = data.get("thumbnail_url")
+            if not thumb and vid:
+                thumb = "https://i.ytimg.com/vi/%s/hqdefault.jpg" % vid
+            info = {
+                "title": data.get("title") or "Contenido de YouTube",
+                "uploader": data.get("author_name") or "YouTube",
+                "channel": data.get("author_name") or "YouTube",
+                "duration": None,
+                "width": data.get("thumbnail_width"),
+                "height": data.get("thumbnail_height"),
+                "ext": "mp4",
+                "thumbnail": thumb,
+                "thumbnails": [{"url": thumb}] if thumb else [],
+                "description": "",
+            }
+            return info
+        except Exception as exc:
+            log("youtube oembed %s: %r" % (url, exc))
+            vid = self._youtube_video_id(url)
+            if vid:
+                return {
+                    "title": "Contenido de YouTube",
+                    "uploader": "YouTube",
+                    "channel": "YouTube",
+                    "duration": None,
+                    "width": None,
+                    "height": None,
+                    "ext": "mp4",
+                    "thumbnail": "https://i.ytimg.com/vi/%s/hqdefault.jpg" % vid,
+                    "thumbnails": [{"url": "https://i.ytimg.com/vi/%s/hqdefault.jpg" % vid}],
+                    "description": "",
+                }
+            return None
+
+    def _metadata_referer(self, url):
+        u = (url or "").lower()
+        if "tiktok.com" in u:
+            return "https://www.tiktok.com/"
+        if "youtube.com" in u or "youtu.be" in u:
+            return "https://www.youtube.com/"
+        if "instagram.com" in u:
+            return "https://www.instagram.com/"
+        if "pinterest." in u or "pin.it" in u:
+            return "https://www.pinterest.com/"
+        return "https://www.google.com/"
+
     def fetch_metadata(self, url):
-        if url in self._metadata_cache:
-            info = self._metadata_cache[url]
-            title = str(info.get("title") or "Contenido detectado")
-            author = str(info.get("uploader") or info.get("channel") or info.get("creator") or "Autor no disponible")
-            duration = info.get("duration")
-            duration_text = f"{int(duration)//60}:{int(duration)%60:02d}" if duration else "Duración no disponible"
-            width, height = info.get("width"), info.get("height")
-            resolution = f"{width} × {height}" if width and height else "Resolución disponible al descargar"
-            meta = f"@{author.lstrip('@')}  ·  {duration_text}  ·  {resolution}  ·  {str(info.get('ext') or 'media').upper()}"
-            self.apply_metadata(url, title, meta, None, "Miniatura no disponible")
-            return
         if url in self._metadata_loading:
-            return
+            if url not in self._metadata_cache:
+                return
         self._metadata_loading.add(url)
         def worker():
             try:
-                import yt_dlp
-                ensure_temp_dir()
-                opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-                        "socket_timeout": 10, "retries": 0, "extractor_retries": 0,
-                        "paths": {"temp": str(TEMP_DIR)}}
-                opts.update(yt_cookie_opts(url))
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                self._metadata_cache[url] = info
+                cached = self._metadata_cache.get(url)
+                info = cached
+                if info is None:
+                    import yt_dlp
+                    ensure_temp_dir()
+                    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+                            "socket_timeout": 10, "retries": 0, "extractor_retries": 0,
+                            "paths": {"temp": str(TEMP_DIR)}}
+                    opts.update(yt_cookie_opts(url, self.cfg))
+                    try:
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            info = ydl.extract_info(url, download=False)
+                    except Exception as exc:
+                        log("metadata yt-dlp %s: %r" % (url, exc))
+                        if "cookiesfrombrowser" in opts or "cookiefile" in opts:
+                            try:
+                                clean_opts = {k: v for k, v in opts.items()
+                                             if k not in ("cookiesfrombrowser", "cookiefile")}
+                                with yt_dlp.YoutubeDL(clean_opts) as ydl:
+                                    info = ydl.extract_info(url, download=False)
+                                log("metadata yt-dlp (sin cookies) OK %s" % url)
+                            except Exception as exc2:
+                                log("metadata yt-dlp sin cookies %s: %r" % (url, exc2))
+                                info = None
+                    if info is not None:
+                        self._metadata_cache[url] = info
+
+                is_yt = ("youtube.com" in (url or "").lower()) or ("youtu.be" in (url or "").lower())
+                if info is None and is_yt:
+                    info = self._youtube_oembed_info(url)
+                    if info is not None:
+                        self._metadata_cache[url] = info
+
+                if info is None and ("instagram.com/p/" in (url or "").lower()
+                                    or "pinterest." in (url or "").lower()
+                                    or "pin.it/" in (url or "").lower()):
+                    try:
+                        entries = gallery_dl_extract(url, self.cfg)
+                        first = entries[0]
+                        title = str(first.get("description") or first.get("post_id") or "Publicacion de imagenes")
+                        author = str(first.get("username") or first.get("owner") or "Instagram")
+                        thumb_data = None
+                        thumb_url = (first.get("_indiedl_url") or first.get("_url")
+                                     or first.get("url") or first.get("file_url") or first.get("gdl_file_url"))
+                        # Solo URLs http(s) descargables: los esquemas internos
+                        # (p. ej. ytdl://... de videos) hacen que urlopen falle
+                        # con "unknown url type".
+                        if thumb_url and not str(thumb_url).lower().startswith(("http://", "https://")):
+                            thumb_url = None
+                        if thumb_url:
+                            try:
+                                from urllib.request import Request, urlopen
+                                req = Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+                                with urlopen(req, timeout=8) as response:
+                                    thumb_data = response.read(2500000)
+                            except Exception as thumb_exc:
+                                log("gallery thumbnail %s: %r" % (url, thumb_exc))
+                        meta = "%s  ·  %d imagen(es)  ·  Original" % (author, len(entries))
+                        self.after(0, lambda: self.apply_metadata(url, title, meta, thumb_data, "Miniatura cargada" if thumb_data else "No se pudo cargar la miniatura"))
+                        return
+                    except Exception as gallery_exc:
+                        log("metadata gallery-dl %s: %r" % (url, gallery_exc))
+
+                if info is None:
+                    self.after(0, lambda: self.apply_metadata(url, "No se pudieron cargar los detalles",
+                                                             "El enlace se recibio correctamente. La descarga se puede intentar igualmente; revisa la conexion o el registro.",
+                                                             None, "Vista previa no disponible"))
+                    return
+
                 title = str(info.get("title") or "Contenido detectado")
                 author = str(info.get("uploader") or info.get("channel") or info.get("creator") or "Autor no disponible")
                 description = str(info.get("description") or "").strip().replace("\n", " ")
@@ -1062,11 +1196,11 @@ class App(ctk.CTk):
                 if len(description) > 180:
                     description = description[:177].rstrip() + "…"
                 dur = info.get("duration")
-                duration = f"{int(dur)//60}:{int(dur)%60:02d}" if dur else "Duración no disponible"
+                duration = "%d:%02d" % (int(dur)//60, int(dur)%60) if dur else "Duracion no disponible"
                 width, height = info.get("width"), info.get("height")
-                resolution = f"{width} × {height}" if width and height else "Resolución disponible al descargar"
+                resolution = "%s x %s" % (width, height) if width and height else "Resolucion disponible al descargar"
                 ext = str(info.get("ext") or "media").upper()
-                meta = f"@{author.lstrip('@')}  ·  {duration}  ·  {resolution}  ·  {ext}"
+                meta = "@%s  ·  %s  ·  %s  ·  %s" % (author.lstrip("@"), duration, resolution, ext)
                 if description:
                     meta += "\n" + description
                 thumb_data = None
@@ -1086,7 +1220,12 @@ class App(ctk.CTk):
                             candidate = item.get("url")
                             if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
                                 thumb_candidates.append(candidate)
+                vid = self._youtube_video_id(url)
+                if vid:
+                    for suf in ("maxresdefault.jpg", "sddefault.jpg", "hqdefault.jpg", "mqdefault.jpg"):
+                        thumb_candidates.append("https://i.ytimg.com/vi/%s/%s" % (vid, suf))
                 thumb_candidates = list(dict.fromkeys(thumb_candidates))
+                referer = self._metadata_referer(url)
                 if thumb_candidates:
                     try:
                         from urllib.request import Request, urlopen
@@ -1094,44 +1233,24 @@ class App(ctk.CTk):
                             try:
                                 req = Request(thumb_url, headers={
                                     "User-Agent": "Mozilla/5.0",
-                                    "Referer": "https://www.tiktok.com/",
+                                    "Referer": referer,
                                     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                                 })
                                 with urlopen(req, timeout=5) as response:
-                                    data = response.read(2_500_000)
+                                    data = response.read(2500000)
                                 if data:
                                     thumb_data = data
                                     break
                             except Exception as thumb_exc:
-                                log(f"thumbnail candidate {url} ({thumb_url[:100]}): {thumb_exc!r}")
+                                log("thumbnail candidate %s (%s): %r" % (url, thumb_url[:100], thumb_exc))
                     except Exception as thumb_exc:
-                        log(f"thumbnail {url}: {thumb_exc!r}")
+                        log("thumbnail %s: %r" % (url, thumb_exc))
                 self.after(0, lambda: self.apply_metadata(url, title, meta, thumb_data, "Miniatura cargada" if thumb_data else "No se pudo cargar la miniatura"))
             except Exception as exc:
-                log(f"metadata yt-dlp {url}: {exc!r}\n{traceback.format_exc()}")
-                if "instagram.com/p/" in url.lower() or "pinterest." in url.lower() or "pin.it/" in url.lower():
-                    try:
-                        entries = gallery_dl_extract(url, self.cfg)
-                        first = entries[0]
-                        title = str(first.get("description") or first.get("post_id") or "Publicación de imágenes")
-                        author = str(first.get("username") or first.get("owner") or "Instagram")
-                        thumb_data = None
-                        thumb_url = (first.get("_indiedl_url") or first.get("_url")
-                                     or first.get("url") or first.get("file_url") or first.get("gdl_file_url"))
-                        if thumb_url:
-                            try:
-                                from urllib.request import Request, urlopen
-                                req = Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
-                                with urlopen(req, timeout=8) as response:
-                                    thumb_data = response.read(2_500_000)
-                            except Exception as thumb_exc:
-                                log(f"gallery thumbnail {url}: {thumb_exc!r}")
-                        meta = f"{author}  ·  {len(entries)} imagen(es)  ·  Original"
-                        self.after(0, lambda: self.apply_metadata(url, title, meta, thumb_data, "Miniatura cargada" if thumb_data else "No se pudo cargar la miniatura"))
-                        return
-                    except Exception as gallery_exc:
-                        log(f"metadata gallery-dl {url}: {gallery_exc!r}")
-                self.after(0, lambda: self.apply_metadata(url, "No se pudieron cargar los detalles", "El enlace se recibió correctamente. La descarga se puede intentar igualmente; revisá la conexión o el registro.", None, "Vista previa no disponible"))
+                log("fetch_metadata %s: %r\n%s" % (url, exc, traceback.format_exc()))
+                self.after(0, lambda: self.apply_metadata(url, "No se pudieron cargar los detalles",
+                                                         "El enlace se recibio correctamente. La descarga se puede intentar igualmente; revisa la conexion o el registro.",
+                                                         None, "Vista previa no disponible"))
         def guarded_worker():
             try:
                 worker()
@@ -1664,6 +1783,7 @@ class App(ctk.CTk):
         self.cfg["close_when_done"] = self.v_close.get()
         self.cfg["open_folder_done"] = self.v_open.get()
         self.cfg["pcm_resolve"] = self.v_pcm.get()
+        self.cfg["usar_parakeet"] = self.v_parakeet.get()
         save_cfg(self.cfg)
 
         if mode == "image":
@@ -1675,6 +1795,111 @@ class App(ctk.CTk):
             return
 
         self.start_dl(url, mode, folder, quality, clip, None)
+
+    def enter_batch(self, batch):
+        self.batch = batch
+        self.batch_mode = True
+        self._prefix = f"[LOTE {len(batch)}] "
+        self.url.configure(state="disabled")
+        self.url.delete(0, "end")
+        self.url.insert(0, f"Cola de {len(batch)} elementos lista para descargar.")
+        self.v_clip.set(False)
+        self.clip_frame.grid_remove()
+        self.clip_toggle.grid_remove()
+        self._sync_mode_controls()
+
+        for widget in self.preview.winfo_children():
+            widget.destroy()
+
+        ctk.CTkLabel(self.preview, text="LISTA DE DESCARGA", font=(HEAVY, 16), text_color=YEL).pack(anchor="w", padx=14, pady=(14, 10))
+
+        scroll = SmoothScroll(self.preview, fg_color="#0D1116", registry=self._scroll_areas)
+        scroll.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        self.batch_items_ui = []
+        for idx, item in enumerate(batch):
+            row = ctk.CTkFrame(scroll.body, fg_color="#151B21", corner_radius=8)
+            row.pack(fill="x", pady=4)
+
+            thumb_lbl = ctk.CTkLabel(row, text="…", width=48, height=27, fg_color="#252C33",
+                                     text_color=GRAY, corner_radius=4)
+            thumb_lbl.pack(side="left", padx=(10, 6), pady=6)
+
+            icon_lbl = ctk.CTkLabel(row, text="⬇", text_color=GRAY, font=(HEAVY, 16), width=30)
+            icon_lbl.pack(side="left", padx=(0, 6), pady=10)
+
+            title_text = item.get("title", "Sin título")
+            s = item.get("s")
+            e = item.get("e")
+            if s is not None and e is not None:
+                title_text += f"  (✂ {fmt_hms(s)} → {fmt_hms(e)})"
+                
+            title_lbl = ctk.CTkLabel(row, text=title_text[:60], text_color=WHITE, font=("Segoe UI", 12), anchor="w", justify="left")
+            title_lbl.pack(side="left", fill="x", expand=True, pady=10)
+
+            status_lbl = ctk.CTkLabel(row, text="En espera", text_color=GRAY, font=("Segoe UI", 10))
+            status_lbl.pack(side="right", padx=10)
+
+            ui_item = {
+                "frame": row,
+                "icon": icon_lbl,
+                "title": title_lbl,
+                "status": status_lbl,
+                "thumb": thumb_lbl,
+                "url": item["url"]
+            }
+            self.batch_items_ui.append(ui_item)
+            self.after(50, lambda it=ui_item, u=item["url"]: self._load_batch_thumb(it, u))
+
+        self.btn.configure(text=f"⬇  DESCARGAR LOTE ({len(batch)})")
+
+    def _load_batch_thumb(self, ui_item, url):
+        def worker():
+            try:
+                target = ui_item["thumb"]
+                info = self._metadata_cache.get(url)
+                thumb_url = None
+                if isinstance(info, dict):
+                    thumb_url = info.get("thumbnail")
+                    if not thumb_url:
+                        thumbs = info.get("thumbnails") or []
+                        if thumbs:
+                            last = thumbs[-1]
+                            thumb_url = last.get("url") if isinstance(last, dict) else (last if isinstance(last, str) else None)
+                if not thumb_url:
+                    vid = self._youtube_video_id(url) if hasattr(self, "_youtube_video_id") else None
+                    if vid:
+                        thumb_url = "https://i.ytimg.com/vi/%s/hqdefault.jpg" % vid
+                if not thumb_url:
+                    return
+                from urllib.request import Request, urlopen
+                import io
+                from PIL import Image
+                referer = self._metadata_referer(url) if hasattr(self, "_metadata_referer") else "https://www.google.com/"
+                req = Request(thumb_url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer,
+                                                  "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"})
+                with urlopen(req, timeout=5) as resp:
+                    data = resp.read(500000)
+                if not data:
+                    return
+                im = Image.open(io.BytesIO(data)).convert("RGB")
+                im.thumbnail((48, 27), Image.Resampling.LANCZOS)
+                image = ctk.CTkImage(light_image=im, dark_image=im, size=im.size)
+                def apply():
+                    try:
+                        if target.winfo_exists():
+                            target.configure(image=image, text="")
+                    except Exception:
+                        pass
+                self.after(0, apply)
+                self._batch_thumb_refs = getattr(self, "_batch_thumb_refs", [])
+                self._batch_thumb_refs.append(image)
+            except Exception as exc:
+                try:
+                    log("batch thumbnail %s: %r" % (url, exc))
+                except Exception:
+                    pass
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_batch(self):
         items = self.batch
@@ -1694,8 +1919,9 @@ class App(ctk.CTk):
         self.cfg["close_when_done"] = self.v_close.get()
         self.cfg["open_folder_done"] = self.v_open.get()
         self.cfg["pcm_resolve"] = self.v_pcm.get()
+        self.cfg["usar_parakeet"] = self.v_parakeet.get()
         save_cfg(self.cfg)
-        
+
         self.busy = True
         self.form.pack_forget()
         self.pv.pack(fill="both", expand=True)
@@ -1709,6 +1935,7 @@ class App(ctk.CTk):
             self.stat[key].configure(text="-")
         self.p_msg.configure(text="")
         self.cancel.clear()
+        self._last_warn = ""
 
         def worker():
             success = 0
@@ -1718,14 +1945,31 @@ class App(ctk.CTk):
                     break
                 u = item["url"]
                 title = item.get("title", "")
+                s = item.get("s")
+                e = item.get("e")
+                section = (s, e) if s is not None and e is not None else None
+
+                self.q.put(("batch_ui", idx, "downloading", "Descargando..."))
                 self.q.put(("log", f"[{idx+1}/{total}] Iniciando: {title or u}"))
+
                 try:
-                    run_download(u, self.cur_mode, folder, self.cfg, self.q, quality, self.cancel)
+                    run_download(u, self.cur_mode, folder, self.cfg, self.q, quality, self.cancel, section=section, is_batch=True)
                     success += 1
+                    self.q.put(("batch_ui", idx, "done", "Completado"))
                 except Exception as e:
+                    short = str(e).split(".")[0][:60] or "Error"
+                    self.q.put(("batch_ui", idx, "error", short))
                     self.q.put(("log", f"Error en {title or u}: {e}"))
-            self.q.put(("done", folder, f"Lote finalizado: {success}/{total} completados."))
-        
+
+                if idx < total - 1 and not self.cancel.is_set():
+                    self.q.put(("log", "Esperando 3 segundos para evitar detección de bots..."))
+                    time.sleep(3)
+
+            if self.cancel.is_set():
+                self.q.put(("err", "Cancelado"))
+            else:
+                self.q.put(("done", folder, f"Lote finalizado: {success}/{total} completados."))
+
         threading.Thread(target=worker, daemon=True).start()
 
     def start_dl(self, url, mode, folder, quality, clip, image_indices):
@@ -1750,20 +1994,6 @@ class App(ctk.CTk):
             except Exception as e:
                 self.q.put(("err", str(e)))
         threading.Thread(target=worker, daemon=True).start()
-
-    def enter_batch(self, batch):
-        self.batch = batch
-        self.batch_mode = True
-        self._prefix = f"[LOTE {len(batch)}] "
-        self.url.configure(state="disabled")
-        self.url.delete(0, "end")
-        self.url.insert(0, f"Cola de {len(batch)} elementos lista para descargar.")
-        self.v_clip.set(False)
-        self.clip_frame.grid_remove()
-        self.clip_toggle.grid_remove()
-        self._sync_mode_controls()
-
-        self.btn.configure(text=f"⬇  DESCARGAR LOTE ({len(batch)})")
 
     def apply_clip(self, clip):
         self.v_clip.set(True)
@@ -1806,12 +2036,25 @@ class App(ctk.CTk):
             while True:
                 ev = self.q.get_nowait()
                 kind = ev[0]
-                if not self.busy and kind in ("stage", "prog", "log", "note", "warn"):
+                if not self.busy and kind in ("stage", "prog", "log", "note", "warn", "batch_ui"):
                     # Eventos tardíos de una descarga ya cerrada: no tocar la UI.
                     continue
                 if kind == "stage":
                     _, idx, text = ev
                     self.set_stage(idx, text)
+                elif kind == "batch_ui":
+                    _, idx, state, text = ev
+                    if hasattr(self, "batch_items_ui") and idx < len(self.batch_items_ui):
+                        item_ui = self.batch_items_ui[idx]
+                        if state == "downloading":
+                            item_ui["icon"].configure(text="⏳", text_color=YEL)
+                            item_ui["status"].configure(text=text, text_color=YEL)
+                        elif state == "done":
+                            item_ui["icon"].configure(text="✓", text_color=GREEN)
+                            item_ui["status"].configure(text=text, text_color=GREEN)
+                        elif state == "error":
+                            item_ui["icon"].configure(text="✕", text_color=RED)
+                            item_ui["status"].configure(text=text, text_color=RED)
                 elif kind == "prog":
                     _, p, sp, eta, dl, tot, n, total = ev
                     if 0 <= self.stage < len(self.rows):
@@ -1920,6 +2163,17 @@ class App(ctk.CTk):
         self.btn.configure(state="normal", text="⬇  DESCARGAR")
         cancelled = "cancelado" in str(err).lower()
         self.p_msg.configure(text="" if cancelled else err, text_color=RED)
+        # Actualizar estado de los items de la cola (no dejar "Descargando")
+        if getattr(self, "batch_mode", False) and hasattr(self, "batch_items_ui"):
+            for ui in self.batch_items_ui:
+                try:
+                    st = ui["status"]
+                    txt = st.cget("text")
+                    if txt not in ("Completado",):
+                        st.configure(text="Cancelado" if cancelled else "Error", text_color=GRAY if cancelled else RED)
+                        ui["icon"].configure(text="■" if cancelled else "✕", text_color=GRAY if cancelled else RED)
+                except Exception:
+                    pass
         if 0 <= self.stage < len(self.rows):
             self.rows[self.stage]["ic"].configure(fg_color="#DDD" if cancelled else RED, border_width=0)
             self.rows[self.stage]["il"].configure(text="■" if cancelled else "✕",

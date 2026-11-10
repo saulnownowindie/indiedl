@@ -1,12 +1,15 @@
-# IndieDL - dependencias de la aplicacion principal
-# Instalacion:  pip install -r requirements.txt
---pre
-customtkinter==6.0.0
-pillow==13.0.0
-yt-dlp[default,curl-cffi]==2026.10.29.232701.dev0
-gallery-dl==1.32.18
-imageio-ffmpeg==0.7.0
-mutagen==1.48.1
-requests==2.34.2
-websockets==17.3
-curl-cffi==0.16.3
+# Dependencias de IndieDL
+faster-whisper
+numpy
+# Motor Parakeet Ultra (Olicorne/parakeet-tdt-0.6b-v3-ultra-onnx) via onnx-asr
+onnx-asr
+onnxruntime
+# Motor alternativo (fallback de transcripción y respaldo VAD)
+huggingface_hub
+soundfile
+scipy
+silero-vad
+torch
+customtkinter
+yt-dlp
+Pillow
