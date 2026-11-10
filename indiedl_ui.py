@@ -325,6 +325,30 @@ class App(ctk.CTk):
         self.after(120, self.tick)
         self.after(0, self._reveal)
         self.after(400, self._schedule_gallery_check)
+        self.after(600, self._sesion_arranque)
+
+    def _sesion_arranque(self):
+        """Detecta la sesión de Instagram al abrir la app, en silencio.
+
+        Busca en los navegadores (Zen/Firefox/Helium/Chrome/Edge/Brave) si no
+        hay sesión guardada o si la guardada venció; guarda el resultado
+        cifrado. No cierra navegadores ni abre ventanas: si algo falta, avisa
+        sin molestar y se reintenta al descargar.
+        """
+        def worker():
+            ok, status, info = asegurar_sesion_ig_auto(getattr(self, "cfg", None) or {})
+            if ok and info != "vigente":
+                def avisar():
+                    self.msg.configure(text=f"Sesión de Instagram detectada automáticamente "
+                                            f"({BROWSER_PRETTY.get(info, info)}).")
+                    self.after(6000, lambda: self.msg.cget("text").startswith("Sesión de Instagram detectada")
+                               and self.msg.configure(text=""))
+                self.after(0, avisar)
+            elif status == "nosession":
+                self.after(0, lambda: self.msg.configure(
+                    text="Sin sesión de Instagram: iniciá sesión en instagram.com y reiniciá IndieDL, "
+                         "o importá cookies.txt en ⚙ SESIÓN."))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _mark(self, tag):
         if os.environ.get("INDIEDL_PROFILE"):
@@ -1340,9 +1364,9 @@ class App(ctk.CTk):
                     status.configure(text="Ese archivo no tiene la cookie 'sessionid' de instagram.com. "
                                           "Exportalo estando logueado en Instagram.", text_color=RED)
                     return
-                APP_DIR.mkdir(parents=True, exist_ok=True)
-                COOKIES_FILE.write_text(txt, encoding="utf-8")
-                status.configure(text="cookies.txt guardado. Ya no hace falta cerrar el navegador.", text_color=GREEN)
+                _ig_guardar_seguro(txt)
+                status.configure(text="Sesión guardada y cifrada (instagram_cookies.bin). "
+                                      "Ya no hace falta cerrar el navegador.", text_color=GREEN)
                 self.after(1800, win.destroy)
             except Exception as exc:
                 status.configure(text=f"No pude guardar el archivo: {exc}", text_color=RED)
@@ -1973,6 +1997,20 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def start_dl(self, url, mode, folder, quality, clip, image_indices):
+        # Instagram (video/audio): si todavía no hay sesión guardada, se busca
+        # en los navegadores primero (una sola vez por corrida). Así no hace
+        # falta importar nada a mano ni volver a procesar.
+        if ("instagram.com" in (url or "").lower()
+                and not getattr(self, "_ig_auto_dl_done", False)
+                and not cookies_file_path(self.cfg)):
+            self._ig_auto_dl_done = True
+            self.msg.configure(text="Buscando tu sesión de Instagram en los navegadores…")
+            def _continuar(ok, *a):
+                if not ok:
+                    self.msg.configure(text="No encontré sesión de Instagram; intento sin sesión.")
+                self.start_dl(url, mode, folder, quality, clip, image_indices)
+            self.auto_detect_session(_continuar)
+            return
         self.busy = True
         self.show_buttons("run")
         self.form.pack_forget()

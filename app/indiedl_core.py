@@ -776,6 +776,223 @@ def _netscape_cookie_file(path):
         return False
     return False
 
+
+# ── Sesión de Instagram: guardado seguro (DPAPI) + detección automática ──
+IG_COOKIES_BIN = APP_DIR / "instagram_cookies.bin"
+_IG_MATERIAL = {"path": None}  # ruta del cookies.txt temporal de esta corrida
+
+
+def _dpapi_ba(data, proteger=True):
+    """Cifra/descifra bytes con DPAPI de Windows (CurrentUser).
+
+    La clave la administra Windows y está atada a la cuenta de usuario de esta
+    PC: copiar el .bin a otra máquina o a otro usuario vuelve el contenido
+    inservible. No necesita que nadie recuerde ninguna contraseña.
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+    def _entrada(b):
+        buf = (ctypes.c_byte * max(1, len(b))).from_buffer_copy(bytes(b))
+        return _BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))), buf
+
+    def _salida():
+        return _BLOB(0, None)
+
+    def _mantener(*objs):
+        # evita que el GC libere los buffers antes de la llamada a la API
+        return objs
+
+    crypt32 = ctypes.windll.crypt32
+    if proteger:
+        fn, firma = crypt32.CryptProtectData, (
+            ctypes.POINTER(_BLOB), wt.LPCWSTR, ctypes.POINTER(_BLOB),
+            ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(_BLOB))
+    else:
+        fn, firma = crypt32.CryptUnprotectData, (
+            ctypes.POINTER(_BLOB), ctypes.POINTER(wt.LPCWSTR), ctypes.POINTER(_BLOB),
+            ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(_BLOB))
+    fn.argtypes = firma
+    fn.restype = ctypes.c_bool
+
+    if proteger:
+        entrada, buf = _entrada(data)
+        salida = _salida()
+        ok = fn(ctypes.byref(entrada), None, None, None, None, 1, ctypes.byref(salida))
+    else:
+        entrada, buf = _entrada(data)
+        salida = _salida()
+        desc = wt.LPCWSTR()
+        ok = fn(ctypes.byref(entrada), ctypes.byref(desc), None, None, None, 1, ctypes.byref(salida))
+    _mantener(buf)
+    if not ok:
+        raise OSError("DPAPI %s falló (WinError %s)" % (
+            "cifrado" if proteger else "descifrado", ctypes.GetLastError()))
+    res = bytes(ctypes.string_at(salida.pbData, salida.cbData))
+    kernel32 = ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree(salida.pbData)
+    return res
+
+
+def _ig_guardar_seguro(texto):
+    """Guarda el cookies.txt de Instagram cifrado con DPAPI (instagram_cookies.bin)."""
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    binario = _dpapi_ba(texto.encode("utf-8"), proteger=True)
+    tmp = str(IG_COOKIES_BIN) + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(binario)
+    os.replace(tmp, IG_COOKIES_BIN)
+    log("Cookies de Instagram guardadas cifradas (instagram_cookies.bin; "
+        "solo se abren con tu cuenta de Windows en esta PC).")
+
+
+def _ig_cargar_seguro():
+    """Texto del cookies.txt de Instagram desde el almacenamiento cifrado."""
+    if not IG_COOKIES_BIN.is_file():
+        return ""
+    try:
+        return _dpapi_ba(IG_COOKIES_BIN.read_bytes(), proteger=False).decode("utf-8", errors="replace")
+    except Exception as exc:
+        log(f"No pude descifrar instagram_cookies.bin ({type(exc).__name__}: {exc}); "
+            "el archivo quedó dañado o vino de otra PC. Reimportá la sesión.")
+        return ""
+
+
+def _ig_limpiar_material():
+    p = _IG_MATERIAL.get("path")
+    if p:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        _IG_MATERIAL["path"] = None
+
+
+def _ig_limpiar_stales():
+    """Borra cookies.txt de trabajo temporales de corridas anteriores."""
+    try:
+        for p in APP_DIR.glob("ig_cookies_trabajo_*.txt"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _ig_materializar():
+    """Crea (una vez por corrida) el cookies.txt temporal que usan yt-dlp y gallery-dl."""
+    if _IG_MATERIAL.get("path"):
+        return _IG_MATERIAL["path"]
+    texto = _ig_cargar_seguro()
+    if not texto or "instagram" not in texto or "sessionid" not in texto:
+        return None
+    try:
+        import atexit
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix="ig_cookies_trabajo_", suffix=".txt", dir=str(APP_DIR))
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(texto if texto.endswith("\n") else texto + "\n")
+        _IG_MATERIAL["path"] = path
+        atexit.register(_ig_limpiar_material)
+        return path
+    except OSError as exc:
+        log(f"No pude materializar el cookies.txt de trabajo ({exc}).")
+        return None
+
+
+def _ig_migrar_txt():
+    """Pasa el instagram_cookies.txt plano (import manual viejo) al .bin cifrado y lo borra."""
+    try:
+        if not (COOKIES_FILE.is_file() and COOKIES_FILE.stat().st_size > 0):
+            return
+        if not _netscape_cookie_file(COOKIES_FILE):
+            return
+        texto = COOKIES_FILE.read_text(encoding="utf-8", errors="replace")
+        if "instagram" in texto and "sessionid" in texto:
+            _ig_guardar_seguro(texto)
+            try:
+                COOKIES_FILE.unlink()
+            except OSError:
+                pass
+            log("Cookies guardadas en formato cifrado; el instagram_cookies.txt plano fue eliminado.")
+    except Exception as exc:
+        log(f"Migración de cookies no crítica: {type(exc).__name__}: {exc}")
+
+
+def _fecha_legible(ts):
+    import time as _t
+    try:
+        ts = int(ts)
+        if ts <= 0:
+            return ""
+        return _t.strftime("%d %b %Y", _t.localtime(ts))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def sesion_ig_estado():
+    """Estado de la sesión guardada: (tiene_sesion, vencida, n_cookies, vence_legible)."""
+    texto = _ig_cargar_seguro()
+    if not texto:
+        try:
+            if COOKIES_FILE.is_file() and _netscape_cookie_file(COOKIES_FILE):
+                texto = COOKIES_FILE.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            texto = ""
+    if not texto or "sessionid" not in texto:
+        return False, False, 0, ""
+    import time as _t
+    n, vence, ahora = 0, None, int(_t.time())
+    for line in texto.splitlines():
+        cols = line.strip().split("\t")
+        # Netscape: 0=dominio, 4=expiración, 5=nombre, 6=valor
+        if len(cols) >= 7 and "instagram.com" in cols[0] and cols[5] and not cols[5].startswith("#"):
+            n += 1
+            if cols[5] == "sessionid":
+                try:
+                    vence = int(cols[4])
+                except (TypeError, ValueError):
+                    vence = None
+    vencida = bool(vence and int(vence) <= ahora)
+    return True, vencida, n, _fecha_legible(vence) if vence else ""
+
+
+def asegurar_sesion_ig_auto(cfg=None, forzar=False):
+    """Importa la sesión de Instagram desde los navegadores si falta o venció.
+
+    No abre diálogos ni cierra navegadores: eso queda para el flujo interactivo
+    de la UI (auto_detect_session). Idóneo para correr al abrir la app.
+    Devuelve (ok, status, info) como import_instagram_cookies_auto.
+    """
+    _ig_limpiar_stales()
+    _ig_migrar_txt()
+    tiene, vencida, n, vence = sesion_ig_estado()
+    if tiene and not vencida and not forzar:
+        log(f"Sesión de Instagram vigente ({n} cookies" + (f", vence {vence}" if vence else "") + ").")
+        return True, "ok", "vigente"
+    if tiene and vencida:
+        log(f"Sesión de Instagram vencida ({vence}); buscando una nueva en tus navegadores…")
+    else:
+        log("No hay sesión de Instagram guardada; busco en tus navegadores…")
+    ok, status, info = import_instagram_cookies_auto(cfg)
+    if ok and info != "vigente":
+        log(f"Sesión de Instagram importada automáticamente desde {BROWSER_PRETTY.get(info, info)}.")
+    elif status == "locked":
+        log(f"No pude leer la sesión: {BROWSER_PRETTY.get(info, info)} está abierto y bloquea sus cookies. "
+            "Cerralo y volvé a abrir IndieDL (o importá cookies.txt en ⚙ SESIÓN).")
+    elif status == "nosession":
+        log("Ningún navegador tiene sesión de Instagram: iniciá sesión en instagram.com "
+            "en tu navegador y volvé a abrir IndieDL.")
+    elif not ok:
+        log(f"No pude importar la sesión automáticamente: {info}")
+    return ok, status, info
+
 def yt_cookie_opts(url, cfg=None):
     opts = {}
     u = str(url).lower()
@@ -834,6 +1051,15 @@ def yt_cookie_opts(url, cfg=None):
     return opts
 
 def cookies_file_path(cfg=None):
+    """Ruta de un cookies.txt de Instagram usable por yt-dlp y gallery-dl.
+
+    Prioridad: el .bin cifrado (se materializa a un txt temporal durante la
+    corrida) > el instagram_cookies.txt plano de antes (sin migrar).
+    Devuelve None si no hay sesión guardada.
+    """
+    path = _ig_materializar()
+    if path:
+        return path
     try:
         if COOKIES_FILE.is_file() and COOKIES_FILE.stat().st_size > 0:
             if _netscape_cookie_file(COOKIES_FILE):
@@ -933,6 +1159,7 @@ def _instagram_cookie_rows(jar):
     return rows, has
 
 def import_instagram_cookies_auto(cfg=None):
+    _ig_migrar_txt()
     try:
         from yt_dlp.cookies import extract_cookies_from_browser
     except Exception as exc:
@@ -959,9 +1186,8 @@ def import_instagram_cookies_auto(cfg=None):
         rows, has = _instagram_cookie_rows(jar)
         if has:
             try:
-                APP_DIR.mkdir(parents=True, exist_ok=True)
-                COOKIES_FILE.write_text("\n".join(rows) + "\n", encoding="utf-8")
-            except OSError as exc:
+                _ig_guardar_seguro("\n".join(rows) + "\n")
+            except Exception as exc:
                 return False, "error", f"No pude guardar las cookies: {exc}"
             log(f"Sesión de Instagram detectada en {label} ({len(rows) - 1} cookies guardadas).")
             return True, "ok", label
