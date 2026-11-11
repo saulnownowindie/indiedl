@@ -1,0 +1,23 @@
+{
+  "guion": "D:/2026/noviembre/9 nov/9 nov.docx",
+  "idioma": "es",
+  "modelo": "large-v3-turbo",
+  "pista_audio": 1,
+  "pista_video": 1,
+  "copiar_otras_pistas": false,
+  "rango": "inout",
+  "modo": "ultima",
+  "pausa": 0.5,
+  "bajada_db": 8.0,
+  "usar_cache": true,
+  "marcar_ok": false,
+  "generar_subtitulos": true,
+  "plantilla": "PLANTILLA / inindie now v2",
+  "srt_como_pista": false,
+  "verificar": true,
+  "silencio_min": 0.7,
+  "pre": 0.1,
+  "post": 0.2,
+  "padding_max_antes": 0.3,
+  "padding_max_despues": 0.35
+}
