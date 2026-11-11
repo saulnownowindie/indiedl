@@ -21,7 +21,7 @@ from datetime import datetime
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 NOMBRE_APP = "IndieNow-Cortes"
-VERSION = "NUEVO CORTE v2 · volumen por piezas + orden global (DP)"
+VERSION = "NUEVO CORTE v2.1 · sin lecturas, sin huecos de frames, subs alineados al clip"
 
 # ── Aislamiento respecto de subs ────────────────────────────────────────
 BASE_DATOS = os.path.join(

@@ -329,14 +329,26 @@ def aplicar_plantilla(tpl, bloques, tl, mp, fps, f_ini, progreso, log,
     log(f"[plantilla] pista V{pista} creada; {total} titulos en {num_lotes} lotes")
 
     hechos, primera, lote = 0, True, 0
+    prev_end = None
     while hechos < total:
         lote += 1
         tam = 1 if primera else min(_LOTE_INSERCION, total - hechos)
         tramo = bloques[hechos:hechos + tam]
-        infos = [{"mediaPoolItem": tpl, "startFrame": 0,
-                  "endFrame": max(1, round((e - s) * fps)),
-                  "trackIndex": pista, "recordFrame": f_ini + round(s * fps)}
-                 for _, s, e in tramo]
+        infos = []
+        for _, s, e in tramo:
+            # inicio/fin en frames de la timeline, encadenados sin solaparse:
+            # si un bloque arrancaria antes de que termine el anterior, se
+            # empuja al frame en que termina (asi Resolve no recorta nada).
+            sf = f_ini + int(round(s * fps))
+            ef = f_ini + int(round(e * fps))
+            if prev_end is not None and sf < prev_end:
+                sf = prev_end
+            if ef <= sf:
+                ef = sf + 1
+            infos.append({"mediaPoolItem": tpl, "startFrame": 0,
+                          "endFrame": max(1, ef - sf),
+                          "trackIndex": pista, "recordFrame": sf})
+            prev_end = ef
         progreso(p_ini + (p_fin - p_ini) * hechos / max(1, total),
                  f"Subtitulos: lote {lote}/{num_lotes} ({hechos}/{total})...")
         try:
@@ -370,6 +382,21 @@ def ejecutar(resultado, cfg, progreso, log):
         return ["Subtitulos: no habia palabras alineadas; no se generaron."]
 
     grupos, limpios = grupos_del_guion(resultado["texto_guion"], resultado["G"])
+
+    # Un titulo entre comillas que cae a caballo de dos clips se PARTE en el
+    # limite del clip: asi ningun subtitulo invade el clip siguiente.
+    mapa = resultado.get("mapa") or []
+    rec0 = resultado.get("rec0")
+
+    def clip_de(seg):
+        if not mapa or rec0 is None:
+            return None
+        fr = rec0 + round(seg * resultado["fps"])
+        for ci, (a, b, sa, ea) in enumerate(mapa):
+            if sa <= fr < ea:
+                return ci
+        return None
+
     datos = []
     nombres = 0
     for texto, a, b, gi in palabras:
@@ -379,8 +406,24 @@ def ejecutar(resultado, cfg, progreso, log):
             limpio = limpios[gi] or texto
         if gr is not None:
             nombres += 1
+            # separa el grupo si esta palabra ya cae en otro clip
+            gr = (gr, clip_de(a))
         datos.append([limpio, a, b, gr])
     bloques = armar_bloques(datos)
+
+    # Recorte final: ningun bloque puede terminar despues del clip donde
+    # empieza (armar_bloques estira el anterior para tocar el siguiente y eso
+    # hacia que invadiera el clip de al lado).
+    if mapa and rec0 is not None:
+        fps = resultado["fps"]
+        for bl in bloques:
+            sf = rec0 + round(bl[1] * fps)
+            for a, b, sa, ea in mapa:
+                if sa <= sf < ea:
+                    lim = (ea - rec0) / fps
+                    if bl[2] > lim:
+                        bl[2] = max(bl[1], lim)
+                    break
     log(f"Subtitulos: {len(bloques)} bloques, {nombres} palabras agrupadas en "
         f"nombres/canciones entre comillas, una palabra por bloque.")
 
@@ -399,8 +442,38 @@ def ejecutar(resultado, cfg, progreso, log):
     fps = resultado["fps"]
     f_ini = tl.GetStartFrame()
 
+    # SRT dentro del Media Pool (SIEMPRE) y, si se pide, como pista de
+    # subtitulos en la timeline, para compararlo con el SRT hecho a mano.
+    # Mismo metodo que la app de subtitulos: ImportMedia + AppendToTimeline
+    # (Resolve crea la pista de subtitulos automaticamente).
+    if ruta_srt:
+        try:
+            importados = mp.ImportMedia([ruta_srt]) or []
+            log(f"SRT en el Media Pool: {len(importados)} elemento(s) "
+                f"({os.path.basename(ruta_srt)}).")
+        except Exception as exc:
+            importados = []
+            log(f"No pude importar el SRT al Media Pool: {exc}")
+        if importados and cfg.get("srt_en_timeline", True):
+            puesto = False
+            for intento in ([{"mediaPoolItem": importados[0], "recordFrame": f_ini}],
+                            [{"mediaPoolItem": importados[0]}]):
+                try:
+                    if mp.AppendToTimeline(intento):
+                        puesto = True
+                        break
+                except Exception:
+                    pass
+            if puesto:
+                log("SRT agregado como pista de subtitulos de la timeline del reel.")
+            else:
+                log("El SRT quedo en el Media Pool; arrastralo a una pista de "
+                    "subtitulos para verlo en la timeline.")
+
     if cfg.get("srt_como_pista", False) or not cfg.get("generar_subtitulos", True):
-        lineas = [f"Subtitulos: SRT listo ({len(bloques)} bloques). No se insertaron en la timeline."]
+        lineas = [f"Subtitulos: SRT listo ({len(bloques)} bloques) en el Media Pool."
+                  + ("" if cfg.get("srt_en_timeline", True) else
+                     " No se agrego a la timeline.")]
         if ruta_srt:
             lineas.append("SRT: " + ruta_srt)
         return lineas
@@ -415,10 +488,11 @@ def ejecutar(resultado, cfg, progreso, log):
 
     try:
         n = aplicar_plantilla(tpl, bloques, tl, mp, fps, f_ini, progreso, log, 92, 99)
-        return [f"Subtitulos: {n} bloques insertados en la timeline del reel "
-                f"(una palabra por subtitulo, nombres entre comillas).",
-                "SRT de respaldo: " + ruta_srt] if ruta_srt else [
-                    f"Subtitulos: {n} bloques insertados en la timeline del reel."]
+        lineas = [f"Subtitulos: {n} bloques insertados en la timeline del reel "
+                  f"(una palabra por subtitulo, nombres entre comillas)."]
+        if ruta_srt:
+            lineas.append("SRT en el Media Pool y como pista de subtitulos: " + ruta_srt)
+        return lineas
     except Exception as exc:
         log.error("No se pudieron insertar los subtitulos", exc)
         return [f"Subtitulos: fallo la insercion ({exc}). El SRT esta listo para importar: {ruta_srt}"]

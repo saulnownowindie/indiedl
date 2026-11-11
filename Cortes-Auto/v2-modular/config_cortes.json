@@ -1,5 +1,5 @@
 {
-  "guion": "D:/2026/noviembre/9 nov/9 nov.docx",
+  "guion": "D:\\2026\\noviembre\\9 nov\\9 nov.docx",
   "idioma": "es",
   "modelo": "large-v3-turbo",
   "pista_audio": 1,
@@ -14,6 +14,7 @@
   "generar_subtitulos": true,
   "plantilla": "PLANTILLA / inindie now v2",
   "srt_como_pista": false,
+  "srt_en_timeline": true,
   "verificar": true,
   "silencio_min": 0.7,
   "pre": 0.1,

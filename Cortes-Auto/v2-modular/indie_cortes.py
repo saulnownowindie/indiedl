@@ -20,6 +20,7 @@ from collections import defaultdict
 import difflib
 import hashlib
 import math
+import re
 import os
 import pickle
 import subprocess
@@ -593,11 +594,25 @@ def clasificar_tomas(T, Tn, cs, G, g, niv, thresh, pausa, vocab, modo):
     return cs
 
 
+def _hay_habla(niv, thresh, t0, t1):
+    """True si en [t0, t1] hay HABLA (volumen de toma real, no respiracion)."""
+    if not niv or thresh is None:
+        return True
+    a = max(0, int(t0 / PASO_ENV))
+    b = min(len(niv), int(t1 / PASO_ENV) + 1)
+    return a < b and max(niv[a:b]) >= thresh
+
+
 def cortes_de_toma(T, i, j, pausa, voz, excluir=(), pre=PRE, post=POST,
-                   max_antes=MAX_ANTES, max_despues=MAX_DESPUES):
+                   max_antes=MAX_ANTES, max_despues=MAX_DESPUES,
+                   niv=None, thresh=None):
     """P2: segundos (inicio, fin) de una toma, con bordes ajustados al silencio.
     Nunca corta a mitad de palabra: inicio <= primer inicio de palabra y
-    fin >= ultimo sonido real de la ultima palabra (protege la 's' final)."""
+    fin >= ultimo sonido real de la ultima palabra (protege la 's' final).
+
+    Solo separa piezas cuando el hueco NO tiene habla: si en la pausa sigue
+    sonando la voz (palabra que Whisper no transcribio, final de palabra),
+    la toma se mantiene entera para no cortar a mitad de frase."""
     piezas, a = [], None
     for k in range(i, j):
         if k in excluir:
@@ -607,7 +622,7 @@ def cortes_de_toma(T, i, j, pausa, voz, excluir=(), pre=PRE, post=POST,
             continue
         if a is None:
             a = k
-        elif T[k][1] - T[k - 1][2] > pausa:
+        elif T[k][1] - T[k - 1][2] > pausa and not _hay_habla(niv, thresh, T[k - 1][2], T[k][1]):
             piezas.append((a, k))
             a = k
     if a is not None:
@@ -734,6 +749,10 @@ def planear(T, G, modo, pausa, voz, niv=None, bajada=0.0,
                 nxt[fin_prev] = (nuevo, (gg, fin_prev, "salto", None))
             # opcion B: usar una toma (avanza cubre palabras del guion)
             for c in cs:
+                if c["baja"]:
+                    # solo lectura / sin decir a camara: NO se usa; queda
+                    # como FALTA (rojo) para arreglar a mano
+                    continue
                 if c["i"] < fin_prev:
                     continue
                 bono = BONO_ADY if (fin_prev and c["i"] - fin_prev <= 1) else 0.0
@@ -765,6 +784,20 @@ def planear(T, G, modo, pausa, voz, niv=None, bajada=0.0,
         for w in range(gg, gg + sin_audio):
             falta_actual.append(w)
         incl = [k for k in range(c["i"], c["fin"]) if k not in c["extra_todas"]]
+        # piezas calladas MUY cortas pegadas a los bordes = ruido (carraspeo,
+        # "ahem"): no se cortan ni se subtitulan
+        excl_corte = set(c["extra_todas"])
+        salto_ini = 0
+        for pa, pb, _mx in c.get("calladas", []):
+            if T[pb - 1][2] - T[pa][1] >= 0.8:
+                continue
+            if pa == c["i"]:
+                salto_ini += sum(1 for k in range(pa, pb) if k not in c["extra_todas"])
+            elif pb != c["fin"]:
+                continue
+            for k in range(pa, pb):
+                excl_corte.add(k)
+            incl = [k for k in incl if not (pa <= k < pb)]
         ini_real = incl[0] if incl else c["i"]
         t_ini = T[ini_real][1]
         cerrar_faltas(t_ini)
@@ -804,7 +837,7 @@ def planear(T, G, modo, pausa, voz, niv=None, bajada=0.0,
 
         # palabras para subtitulos: texto del guion cuando coincide (corrige
         # nombres raros mal oidos), con tiempos de la transcripcion real.
-        gi0 = gg + c.get("k", 0) - c.get("m", 0)
+        gi0 = gg + c.get("k", 0) - c.get("m", 0) + salto_ini
         for off, k in enumerate(incl):
             gi = gi0 + off
             if 0 <= gi < len(G) and Tn[k] == G[gi][0]:
@@ -814,8 +847,9 @@ def planear(T, G, modo, pausa, voz, niv=None, bajada=0.0,
             palabras_para_subs.append((k, gi, texto, T[k][1], T[k][2]))
 
         usados.append((c["i"], c["fin"]))
-        cortes += cortes_de_toma(T, c["i"], c["fin"], pausa, voz, c["extra"],
-                                 pre, post, max_antes, max_despues)
+        cortes += cortes_de_toma(T, c["i"], c["fin"], pausa, voz, excl_corte,
+                                 pre, post, max_antes, max_despues,
+                                 niv=niv, thresh=thresh)
         traza.append(
             f"{t_ini:7.1f}s  g={gg:3} guion: {' '.join(palabras[gg:gg + c['cubre']])[:70]}\n"
             f"            toma: {' '.join(Tn[c['i']:c['fin']])[:70]}\n"
@@ -897,10 +931,19 @@ def _fps_clip(mpi):
         return FPS
 
 
-def infos_pista(tipo, pista, cortes_f, rec0, destino=1):
+def infos_pista(tipo, pista, cortes_f, rec0, destino=1, con_record=True):
+    """clipInfos para AppendToTimeline.
+
+    Si con_record=False NO se fija recordFrame: Resolve encadena los clips
+    uno detras de otro SIN huecos (el redondeo de duracion por clip dejaba
+    un frame vacio entre cada par). Cada info guarda _cut (indice del corte)
+    y _off (desplazamiento dentro del corte) para mapear los subtitulos a
+    las posiciones REALES de la timeline.
+    """
     items = timeline.GetItemListInTrack(tipo, pista) or []
+    items = sorted(items, key=lambda it: it.GetStart())
     out, acum = [], 0
-    for a, b in cortes_f:
+    for ci, (a, b) in enumerate(cortes_f):
         for it in items:
             aa, bb = max(a, it.GetStart()), min(b, it.GetEnd())
             if bb <= aa:
@@ -910,28 +953,57 @@ def infos_pista(tipo, pista, cortes_f, rec0, destino=1):
                 continue
             f = _fps_clip(mpi)
             sf = round((it.GetLeftOffset() + (aa - it.GetStart())) / FPS * f)
-            n = max(1, round((bb - aa) / FPS * f))
-            out.append({"mediaPoolItem": mpi, "startFrame": sf, "endFrame": sf + n - 1,
-                        "mediaType": 1 if tipo == "video" else 2, "trackIndex": destino,
-                        "recordFrame": rec0 + acum + (aa - a)})
+            dur = (bb - aa) / FPS * f
+            # audio: hacia arriba para no dejar silencios de 1 frame en los
+            # cortes; video: al frame mas cercano (se encadena sin huecos).
+            n = max(1, math.ceil(dur) if tipo == "audio" else round(dur))
+            info = {"mediaPoolItem": mpi, "startFrame": sf, "endFrame": sf + n - 1,
+                    "mediaType": 1 if tipo == "video" else 2, "trackIndex": destino,
+                    "_cut": ci, "_off": aa - a}
+            if con_record:
+                info["recordFrame"] = rec0 + acum + (aa - a)
+            out.append(info)
         acum += b - a
     return out
 
 
-def pos_en_nueva(cortes_f, frame_orig):
-    acum = 0
-    for a, b in cortes_f:
+def pos_en_nueva(mapa, frame_orig, rec0):
+    """Frame (relativo al inicio del reel) de un frame del rango original."""
+    for a, b, sa, ea in mapa:
         if a <= frame_orig < b:
-            return acum + (frame_orig - a)
-        acum += b - a
+            return min((sa - rec0) + (frame_orig - a), (ea - rec0) - 1)
     return None
 
 
-def _mapear_tiempo(cortes_f, seg_orig, f_ini):
+def _mapear_tiempo(mapa, seg_orig, f_ini, rec0):
     """Segundo en la timeline NUEVA de un segundo del rango original."""
     fr = f_ini + round(seg_orig * FPS)
-    pos = pos_en_nueva(cortes_f, fr)
+    pos = pos_en_nueva(mapa, fr, rec0)
     return None if pos is None else pos / FPS
+
+
+def _mapear_rango(mapa, s0, e0, f_ini, rec0):
+    """(inicio, fin) en la timeline NUEVA de una palabra, SIN pasarse del clip.
+
+    El fin se recorta al final del clip que contiene el INICIO de la palabra:
+    asi un subtitulo nunca invade el clip siguiente (eso hacia que Resolve
+    recortara el subtitulo anterior al insertar el nuevo).
+    """
+    fs = f_ini + round(s0 * FPS)
+    fe = f_ini + round(e0 * FPS)
+    for a, b, sa, ea in mapa:
+        if a <= fs < b:
+            ini = (sa - rec0) + (fs - a)
+            fin = (sa - rec0) + (min(fe, b) - a)
+            fin = min(fin, (ea - rec0))
+            return ini / FPS, max(fin, ini + 1) / FPS
+    # la palabra empieza en un hueco entre cortes: la pegamos al proximo clip
+    for a, b, sa, ea in mapa:
+        if a > fs:
+            ini = sa - rec0
+            fin = min(ini + max(fe - a, 1), ea - rec0)
+            return ini / FPS, max(fin, ini + 1) / FPS
+    return None
 
 
 def poner_marca(tl, frame, color, nombre, nota, dur=1):
@@ -947,8 +1019,21 @@ def poner_marca(tl, frame, color, nombre, nota, dur=1):
     return False
 
 
+def _contar_huecos(tl, tipo, pista):
+    """Cuenta huecos entre clips consecutivos de una pista (diagnostico)."""
+    try:
+        items = sorted(tl.GetItemListInTrack(tipo, pista) or [],
+                       key=lambda it: it.GetStart())
+    except Exception:
+        return 0
+    return sum(1 for prev, cur in zip(items, items[1:])
+               if cur.GetStart() - prev.GetEnd() > 0)
+
+
 def construir(cortes_f, pista_audio, pista_video, otras, log):
-    nombre, n = f"{TL_NAME} - REEL", 1
+    # Evita "X - REEL - REEL" si ya se corrio sobre un reel.
+    base = re.sub(r"\s*-\s*REEL(?:\s+\d+)?$", "", TL_NAME, flags=re.I) or TL_NAME
+    nombre, n = f"{base} - REEL", 1
     previa = mp.GetCurrentFolder()
     try:
         destino = carpeta_de_timeline()
@@ -965,30 +1050,73 @@ def construir(cortes_f, pista_audio, pista_video, otras, log):
         raise RuntimeError("No pude crear la timeline nueva.")
     project.SetCurrentTimeline(nueva)
     rec0 = nueva.GetStartFrame()
-    v = infos_pista("video", pista_video, cortes_f, rec0, 1)
-    a = infos_pista("audio", pista_audio, cortes_f, rec0, 1)
+
+    # pistas extra de audio (se copian desactivadas)
     extras, dest = [], 2
     if otras:
         for t in range(1, timeline.GetTrackCount("audio") + 1):
             if t == pista_audio:
                 continue
-            info = infos_pista("audio", t, cortes_f, rec0, dest)
-            if info:
-                while nueva.GetTrackCount("audio") < dest:
-                    nueva.AddTrack("audio")
-                extras.append((dest, info))
-                dest += 1
+            while nueva.GetTrackCount("audio") < dest:
+                nueva.AddTrack("audio")
+            extras.append((dest, t))
+            dest += 1
+
+    # VIDEO: sin recordFrame -> Resolve los encadena sin dejar huecos.
+    v = infos_pista("video", pista_video, cortes_f, rec0, 1, con_record=False)
     ok_v = (not v) or bool(mp.AppendToTimeline(v))
+    items_v = sorted(nueva.GetItemListInTrack("video", 1) or [],
+                     key=lambda it: it.GetStart())
+
+    # posiciones REALES de cada corte (para audio y subtitulos)
+    cut_pos = {}
+    if len(items_v) == len(v):
+        for info, it in zip(v, items_v):
+            ci = info["_cut"]
+            ini, fin = int(it.GetStart()), int(it.GetEnd())
+            if ci in cut_pos:
+                ini = min(ini, cut_pos[ci][0])
+                fin = max(fin, cut_pos[ci][1])
+            cut_pos[ci] = (ini, fin)
+    else:
+        log(f"OJO: {len(items_v)} clips de video vs {len(v)} pedidos; uso "
+            f"posiciones estimadas para audio y subtitulos.")
+        acum = 0
+        for ci, (a, b) in enumerate(cortes_f):
+            cut_pos[ci] = (rec0 + acum, rec0 + acum + (b - a))
+            acum += b - a
+
+    # relleno por si algun corte no tenia video en la pista
+    prev_fin = rec0
+    for ci, (a0, b0) in enumerate(cortes_f):
+        if ci not in cut_pos:
+            cut_pos[ci] = (prev_fin, prev_fin + (b0 - a0))
+        prev_fin = cut_pos[ci][1]
+
+    # AUDIO: mismo inicio que el video real (sin desfase) y sin silencios.
+    a = infos_pista("audio", pista_audio, cortes_f, rec0, 1, con_record=False)
+    for info in a:
+        info["recordFrame"] = cut_pos[info["_cut"]][0] + info["_off"]
     ok_a = (not a) or bool(mp.AppendToTimeline(a))
-    for d, info in extras:
-        ok_a = bool(mp.AppendToTimeline(info)) and ok_a
+    for d, t in extras:
+        ex = infos_pista("audio", t, cortes_f, rec0, d, con_record=False)
+        for info in ex:
+            info["recordFrame"] = cut_pos[info["_cut"]][0] + info["_off"]
+        if ex:
+            ok_a = bool(mp.AppendToTimeline(ex)) and ok_a
         try:
             nueva.SetTrackEnable("audio", d, False)
         except Exception:
             pass
+
+    mapa = [(a0, b0, cut_pos[ci][0], cut_pos[ci][1])
+            for ci, (a0, b0) in enumerate(cortes_f)]
+    huecos = _contar_huecos(nueva, "video", 1)
+    if huecos:
+        log(f"OJO: quedaron {huecos} hueco(s) entre clips de video.")
     log(f"Timeline '{nueva.GetName()}': {len(v)} trozos de video, {len(a)} de audio, "
         f"{len(extras)} pistas extra desactivadas. ok_v={ok_v} ok_a={ok_a}")
-    return nueva, ok_v, ok_a, len(v), len(a), len(extras)
+    return nueva, ok_v, ok_a, len(v), len(a), len(extras), mapa
 
 
 # ── Proceso principal ───────────────────────────────────────────────────
@@ -1106,17 +1234,18 @@ def ejecutar(cfg, progreso, log):
 
     log.paso("4 · Armar la timeline del reel en Resolve")
     progreso(90, "Armando la timeline nueva...")
-    nueva, ok_v, ok_a, nv, na, ne = construir(
+    nueva, ok_v, ok_a, nv, na, ne, mapa = construir(
         cortes_f, pista, p_video, bool(cfg.get("copiar_otras_pistas", False)), log)
+    rec0 = nueva.GetStartFrame()
 
-    # Palabras mapeadas a la timeline NUEVA (para subtitulos y verificacion)
+    # Palabras mapeadas a las posiciones REALES de la timeline NUEVA
     palabras_nueva = []
-    for k, gi, texto, s0, e0 in pal_subs:
-        a = _mapear_tiempo(cortes_f, s0, f_ini)
-        b = _mapear_tiempo(cortes_f, e0, f_ini)
-        if a is None or b is None:
+    for k, gi, tx, s0, e0 in pal_subs:
+        rango = _mapear_rango(mapa, s0, e0, f_ini, rec0)
+        if rango is None:
             continue
-        palabras_nueva.append([texto, a, max(b, a + 0.05), gi])
+        a, b = rango
+        palabras_nueva.append([tx, a, max(b, a + 0.05), gi])
 
     # Marcadores, con minuto en la timeline NUEVA para el reporte
     progreso(96, "Poniendo marcadores...")
@@ -1130,9 +1259,9 @@ def ejecutar(cfg, progreso, log):
         if ev["color"] == C_OK and not cfg.get("marcar_ok", False):
             continue
         if ev["t"] is None:
-            pos = max(0, sum(b - a for a, b in cortes_f) - 1)
+            pos = max(0, (mapa[-1][3] - rec0) - 1) if mapa else 0
         else:
-            pos = pos_en_nueva(cortes_f, f_ini + round(ev["t"] * FPS))
+            pos = pos_en_nueva(mapa, f_ini + round(ev["t"] * FPS), rec0)
         if pos is not None:
             minuto = K.mmss(pos / FPS)
             if ev["color"] in (C_FALTA, C_DIFIERE, C_DUDA):
@@ -1152,13 +1281,18 @@ def ejecutar(cfg, progreso, log):
                (f". {fallos} no se pudieron poner." if fallos else "."))
     rep.append(f"Timeline creada: {nueva.GetName()} ({nv} trozos de video, {na} de audio" +
                (f", {ne} pistas extra desactivadas)." if ne else ")."))
+    rep.append("La timeline original quedo intacta: el corte se armo en la timeline nueva.")
     if nv == 0:
         rep.append("OJO: no encontre video en esa pista de video.")
     if not (ok_v and ok_a):
         rep.append("OJO: Resolve rechazo parte de los clips. Revisa la timeline.")
 
+    if mapa:
+        dur_final = (mapa[-1][3] - rec0) / FPS
+
     return {
-        "nueva": nueva, "cortes_f": cortes_f, "G": G, "texto_guion": texto,
+        "nueva": nueva, "cortes_f": cortes_f, "mapa": mapa, "rec0": rec0,
+        "G": G, "texto_guion": texto,
         "palabras_nueva": palabras_nueva, "eventos": eventos, "rep": rep,
         "lineas_dudosas": sorted(lineas_dudosas, key=lambda x: x["minuto"]),
         "lecturas": lecturas, "f_ini": f_ini, "f_fin": f_fin,
