@@ -145,6 +145,7 @@ DEFAULTS = {
     "generar_subtitulos": True,
     "plantilla": "PLANTILLA / inindie now v2",
     "srt_como_pista": False,
+    "srt_en_timeline": True,
     "verificar": True,
     "silencio_min": 0.7,
     "pre": 0.10,
